@@ -873,7 +873,33 @@ if(!Array.isArray(S.prHistory)) S.prHistory=[];   // migrate older saves
 if(!S.targets) S.targets={cal:TARGETS.cal,protein:TARGETS.protein,carbs:TARGETS.carbs,fat:TARGETS.fat};
 if(!Array.isArray(S.adjustLog)) S.adjustLog=[];
 if(typeof S.mealWeek!=='number') S.mealWeek=0;
-function save(){ try{ localStorage.setItem(KEY, JSON.stringify(S)); }catch(e){ toast("Storage full — export soon"); } }
+function save(){ try{ localStorage.setItem(KEY, JSON.stringify(S)); }catch(e){ toast("Storage full — export soon"); } scheduleVault(); }
+
+/* ---------- resilient backup: IDB vault mirror + file export/restore ----------
+   The vault is a SEPARATE IndexedDB store, so if another app on this web address
+   clears localStorage, your data survives here and auto-restores on next open.
+   The file export is your off-device safety net (save it to Files / iCloud). */
+const VAULT_DB="grizzlyVault", VAULT_STORE="state", VAULT_KEY="S";
+let vaultT=null;
+function vaultOpen(){ return new Promise((res,rej)=>{ const rq=indexedDB.open(VAULT_DB,1);
+  rq.onupgradeneeded=()=>{ const db=rq.result; if(!db.objectStoreNames.contains(VAULT_STORE)) db.createObjectStore(VAULT_STORE); };
+  rq.onsuccess=()=>res(rq.result); rq.onerror=()=>rej(rq.error); }); }
+function vaultSave(obj){ return vaultOpen().then(db=>new Promise(res=>{ const tx=db.transaction(VAULT_STORE,"readwrite"); tx.objectStore(VAULT_STORE).put(obj,VAULT_KEY); tx.oncomplete=res; tx.onerror=res; })).catch(()=>{}); }
+function vaultLoad(){ return vaultOpen().then(db=>new Promise(res=>{ const tx=db.transaction(VAULT_STORE,"readonly").objectStore(VAULT_STORE).get(VAULT_KEY); tx.onsuccess=()=>res(tx.result||null); tx.onerror=()=>res(null); })).catch(()=>null); }
+function scheduleVault(){ if(!('indexedDB'in window))return; clearTimeout(vaultT); vaultT=setTimeout(()=>vaultSave(S),400); }
+function hasData(o){ return !!(o && ((o.weights&&Object.keys(o.weights).length) || (o.checkins&&o.checkins.length) || (o.workouts&&o.workouts.length) || (o.prHistory&&o.prHistory.length))); }
+function normalizeState(){ if(!Array.isArray(S.prHistory))S.prHistory=[]; if(!S.targets)S.targets={cal:TARGETS.cal,protein:TARGETS.protein,carbs:TARGETS.carbs,fat:TARGETS.fat}; if(!Array.isArray(S.adjustLog))S.adjustLog=[]; if(typeof S.mealWeek!=='number')S.mealWeek=0; if(!S.groceryChecked)S.groceryChecked={}; if(!S.nutrition)S.nutrition={}; if(!S.prs)S.prs={}; }
+function doExport(){
+  try{ const blob=new Blob([JSON.stringify(S,null,2)],{type:"application/json"});
+    const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="project-grizzly-backup-"+todayISO()+".json";
+    document.body.appendChild(a); a.click(); setTimeout(()=>{a.remove(); URL.revokeObjectURL(a.href);},1200);
+    S.lastBackup=todayISO(); save(); toast("Backup saved — choose “Save to Files”",true);
+  }catch(e){ toast("Backup failed — try again"); }
+}
+function doImport(file){ if(!file) return; const rd=new FileReader();
+  rd.onload=()=>{ try{ const obj=JSON.parse(rd.result); if(!obj||typeof obj!=='object') throw 0; S=obj; normalizeState(); save(); toast("Backup restored — welcome back",true); render(); }
+    catch(err){ toast("Couldn't read that backup file"); } };
+  rd.readAsText(file); }
 
 /* ---------- dynamic targets + coaching engine ---------- */
 function T(){ const t=S.targets||{}; return {
@@ -1267,6 +1293,18 @@ function VIEW_dash(){
   </div>
 
   ${coachCard()}
+
+  ${(()=>{ const backed=S.lastBackup, warn=!backed; return `
+  <div class="section-h"><h2>Data Safety</h2>${warn?'<span class="badge" style="background:rgba(240,85,59,.14);color:#f5a394;border-color:rgba(240,85,59,.35)">Back up</span>':''}<div class="rule"></div></div>
+  <div class="card" style="${warn?'border-color:rgba(240,85,59,.35)':''}">
+    <p class="hint" style="margin:0 0 10px">Your log lives on this device. Save a backup to your <b>Files / iCloud</b> so it can never be lost. It also auto-saves a hidden on-device copy.</p>
+    <div class="rowbtn">
+      <button class="btn teal" data-backup>⬇︎ Back up now</button>
+      <button class="btn ghost" data-restore>Restore</button>
+    </div>
+    <input type="file" id="restoreFile" accept="application/json" style="display:none"/>
+    <div class="small" style="margin-top:9px">${backed?('✓ Last backup '+fmtDate(backed)):'⚠ Not backed up yet — tap Back up now'}</div>
+  </div>`; })()}
 
   <div class="section-h"><h2>Today's Mission</h2><div class="rule"></div></div>
   <div class="card">
@@ -1880,6 +1918,9 @@ function bind(){
   document.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>go(b.dataset.go));
   document.querySelectorAll("[data-applycal]").forEach(b=>b.onclick=()=>{
     applyCalorie(parseInt(b.dataset.applycal)); toast("Calorie target updated → "+T().cal+" kcal",true); render(); });
+  document.querySelectorAll("[data-backup]").forEach(b=>b.onclick=doExport);
+  document.querySelectorAll("[data-restore]").forEach(b=>b.onclick=()=>{ const f=document.getElementById("restoreFile"); if(f) f.click(); });
+  const rf=document.getElementById("restoreFile"); if(rf) rf.onchange=e=>doImport(e.target.files[0]);
 
   if(route==="weigh") bindWeigh();
   if(route==="train") bindTrain();
@@ -2038,21 +2079,10 @@ function bindBook(){
   const cs=document.getElementById("cookSearch");
   if(cs) cs.oninput=()=>{ cookQuery=cs.value; const cl=document.getElementById("cookList"); if(cl){ cl.innerHTML=cookbookHtml(); wireRecipes(); } };
   const ex=document.getElementById("exportData");
-  if(ex) ex.onclick=()=>{
-    const blob=new Blob([JSON.stringify(S,null,2)],{type:"application/json"});
-    const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
-    a.download="project-grizzly-backup-"+todayISO()+".json"; a.click();
-    toast("Backup downloaded",true);
-  };
+  if(ex) ex.onclick=doExport;
   const imp=document.getElementById("importData"), file=document.getElementById("importFile");
   if(imp) imp.onclick=()=>file.click();
-  if(file) file.onchange=e=>{
-    const f=e.target.files[0]; if(!f) return;
-    const rd=new FileReader();
-    rd.onload=()=>{ try{ S=JSON.parse(rd.result); save(); toast("Backup restored",true); render(); }
-      catch(err){ toast("Couldn't read that file"); } };
-    rd.readAsText(f);
-  };
+  if(file) file.onchange=e=>doImport(e.target.files[0]);
   const ib=document.getElementById("installBtn");
   if(ib && window.__pgInstall){ ib.style.display="flex"; ib.onclick=async()=>{ window.__pgInstall.prompt();
     const r=await window.__pgInstall.userChoice; if(r&&r.outcome==="accepted"){ ib.style.display="none"; toast("Installing…",true);} window.__pgInstall=null; }; }
@@ -2115,6 +2145,11 @@ function drawMacros(){
 /* ---------- boot ---------- */
 if(!ROUTES.includes(route)) route="dash";
 render();
+// If localStorage looks empty but the vault has data (e.g. another same-origin
+// app cleared storage), recover automatically.
+if(!hasData(S) && ('indexedDB' in window)){
+  vaultLoad().then(v=>{ if(hasData(v)){ S=v; normalizeState(); save(); render(); toast("Recovered your data from on-device backup",true); } });
+} else { scheduleVault(); }
 window.addEventListener("resize",()=>{ if(route==="dash")drawSpark(); if(route==="fuel")drawMacros(); if(route==="progress")drawProgress(); });
 </script>
 <script>
