@@ -3,8 +3,8 @@
    - Static assets (icons/manifest): cache-first for speed
    - Fully offline-capable via cache fallback
    NOTE: user data (localStorage + IndexedDB) is never touched by this cache. */
-const VERSION = 'grizzly-v3';
-const ASSETS = ['index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
+const VERSION = 'grizzly-v4';
+const ASSETS = ['index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'icon-maskable-512.png', 'apple-touch-icon.png', 'mark.png', 'favicon-32.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(
