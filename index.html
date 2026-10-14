@@ -1647,9 +1647,22 @@ function cloudCard(){
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px"><span style="font-size:18px">☁️</span>
         <div><div style="font-weight:700;font-size:14px">Turn on cloud backup</div>
         <div class="small" style="color:var(--ink-2)">Sync across devices &amp; restore after a reinstall. Offline still works — this is a safety net.</div></div></div>
-      <div class="field"><span class="label">Your email · passwordless sign-in</span>
+      <div class="field"><span class="label">Your email · we'll send a 6-digit code</span>
         <input type="email" id="cloudEmail" placeholder="david@example.com" class="tnum" style="text-align:left" autocomplete="email"/></div>
-      <button class="btn teal" id="cloudSignInBtn" style="margin-top:10px">Send sign-in link</button>
+      <button class="btn teal" id="cloudSignInBtn" style="margin-top:10px">Send code</button>
+    </div>`;
+  }
+  if(c.state==="code"){
+    return `<div class="card" style="margin-top:10px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px"><span style="font-size:18px">✉️</span>
+        <div><div style="font-weight:700;font-size:14px">Enter your code</div>
+        <div class="small" style="color:var(--ink-2)">We emailed a 6-digit code to ${c.email}. It expires shortly.</div></div></div>
+      <div class="field"><span class="label">6-digit code</span>
+        <input type="text" inputmode="numeric" maxlength="6" id="cloudCode" placeholder="123456" class="tnum" autocomplete="one-time-code"/></div>
+      <div class="rowbtn" style="margin-top:10px">
+        <button class="btn teal" id="cloudVerifyBtn">Verify &amp; turn on</button>
+        <button class="btn ghost" id="cloudCancelBtn">Back</button>
+      </div>
     </div>`;
   }
   const last=c.lastSync?("Last sync "+timeAgo(c.lastSync)):"Not synced yet";
@@ -2810,6 +2823,8 @@ function bind(){
     else if(a==='backup') doExport(false);
   });
   const csi=document.getElementById("cloudSignInBtn"); if(csi) csi.onclick=()=>{ const e=document.getElementById("cloudEmail"); cloudSignIn(e?e.value.trim():""); };
+  const cvb=document.getElementById("cloudVerifyBtn"); if(cvb) cvb.onclick=()=>{ const e=document.getElementById("cloudCode"); cloudVerify(e?e.value:""); };
+  const ccb=document.getElementById("cloudCancelBtn"); if(ccb) ccb.onclick=()=>cloudCancelCode();
   const csy=document.getElementById("cloudSyncBtn"); if(csy) csy.onclick=()=>cloudSyncNow();
   const cso=document.getElementById("cloudSignOutBtn"); if(cso) cso.onclick=()=>cloudSignOut();
   document.querySelectorAll("[data-applycal]").forEach(b=>b.onclick=()=>{
@@ -3166,7 +3181,7 @@ function drawMacros(){
    user, last-write-wins by S.updatedAt, checksum-guarded, with an
    offline push queue. Never blocks the app.
    ============================================================ */
-const GZ_SB = { url:"", anon:"" };   // filled once the Supabase project exists
+const GZ_SB = { url:"https://lqrvjovasgjqzravxyro.supabase.co", anon:"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxxcnZqb3Zhc2dqcXpyYXZ4eXJvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTIwMTM5NjAsImV4cCI6MjEwNzU4OTk2MH0.1XJIDZSAkHC84-mMXYmwQ6GGDDW5XScP1InvKv19wPc" };   // Project Grizzly cloud sync (public anon key — safe client-side with RLS)
 const SB_LIB = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js";
 let sb=null, cloudApplying=false, cloudDirty=false, cloudPushT=null, cloudBusy=false;
 let cloudUser=null, cloudLastSync=null, cloudErr=null;
@@ -3199,13 +3214,22 @@ async function cloudInit(){
     if(route==="dash") render();
   }catch(e){ cloudErr="init"; }
 }
+let cloudPendingEmail="";
 async function cloudSignIn(email){
   if(!sb||!email) return;
   cloudErr=null;
-  try{ const {error}=await sb.auth.signInWithOtp({email, options:{emailRedirectTo:location.href.split('#')[0]}});
-    if(error) throw error; toast("Check your email for the sign-in link",true);
-  }catch(e){ cloudErr="signin"; toast("Couldn't send the sign-in link"); }
+  try{ const {error}=await sb.auth.signInWithOtp({email, options:{shouldCreateUser:true}});
+    if(error) throw error; cloudPendingEmail=email; toast("Code sent — check your email",true); if(route==="dash") render();
+  }catch(e){ cloudErr="signin"; toast("Couldn't send the code"); }
 }
+async function cloudVerify(code){
+  if(!sb||!cloudPendingEmail||!code) return;
+  cloudErr=null;
+  try{ const {error}=await sb.auth.verifyOtp({email:cloudPendingEmail, token:code.trim(), type:"email"});
+    if(error) throw error; cloudPendingEmail=""; toast("Cloud backup on",true);  // onAuthStateChange pulls
+  }catch(e){ cloudErr="verify"; toast("That code didn't match — try again"); }
+}
+function cloudCancelCode(){ cloudPendingEmail=""; if(route==="dash") render(); }
 async function cloudSignOut(){ if(sb){ try{ await sb.auth.signOut(); }catch(e){} } cloudUser=null; if(route==="dash") render(); }
 async function cloudPull(){
   if(!sb||!cloudUser) return;
@@ -3255,8 +3279,9 @@ function cloudPushDebounced(){
 async function cloudSyncNow(){ if(!sb||!cloudUser){ toast("Sign in to sync"); return; } await cloudPull(); if(cloudDirty) await cloudPush(); toast("Synced",true); }
 function cloudStatus(){
   if(!cloudEnabled() && !window.__GZ_TESTSB) return {state:"off"};
-  if(!cloudUser) return {state:"signedout"};
-  return {state:"on", email:cloudUser.email, lastSync:cloudLastSync, dirty:cloudDirty, err:cloudErr};
+  if(cloudUser) return {state:"on", email:cloudUser.email, lastSync:cloudLastSync, dirty:cloudDirty, err:cloudErr};
+  if(cloudPendingEmail) return {state:"code", email:cloudPendingEmail};
+  return {state:"signedout"};
 }
 
 /* ---------- boot ---------- */
