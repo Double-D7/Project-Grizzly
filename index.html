@@ -1014,7 +1014,7 @@ function migrate(s){
 let S;
 try { const raw=localStorage.getItem(KEY); const parsed=raw?JSON.parse(raw):null; S = (parsed && typeof parsed==='object') ? migrate(parsed) : fresh(); }
 catch(e){ S = fresh(); }
-function save(){ try{ localStorage.setItem(KEY, JSON.stringify(S)); }catch(e){ toast("Storage full — export a backup and free space"); } scheduleVault(); }
+function save(){ if(!cloudApplying) S.updatedAt=Date.now(); try{ localStorage.setItem(KEY, JSON.stringify(S)); }catch(e){ toast("Storage full — export a backup and free space"); } scheduleVault(); if(!cloudApplying) cloudPushDebounced(); }
 
 /* ---------- resilient backup: IDB vault + daily snapshots + file export/restore ----------
    • vault   : a SEPARATE IndexedDB store mirroring state — a same-origin
@@ -1639,6 +1639,38 @@ function reminderBanner(){
     <button class="rm-x" data-remind-dismiss="${r.id}" aria-label="dismiss">×</button>
   </div>`;
 }
+function cloudCard(){
+  const c=cloudStatus();
+  if(c.state==="off") return "";
+  if(c.state==="signedout"){
+    return `<div class="card" style="margin-top:10px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px"><span style="font-size:18px">☁️</span>
+        <div><div style="font-weight:700;font-size:14px">Turn on cloud backup</div>
+        <div class="small" style="color:var(--ink-2)">Sync across devices &amp; restore after a reinstall. Offline still works — this is a safety net.</div></div></div>
+      <div class="field"><span class="label">Your email · passwordless sign-in</span>
+        <input type="email" id="cloudEmail" placeholder="david@example.com" class="tnum" style="text-align:left" autocomplete="email"/></div>
+      <button class="btn teal" id="cloudSignInBtn" style="margin-top:10px">Send sign-in link</button>
+    </div>`;
+  }
+  const last=c.lastSync?("Last sync "+timeAgo(c.lastSync)):"Not synced yet";
+  const st = c.err?('<span style="color:var(--warn)">Sync issue — will retry</span>') : c.dirty?('<span style="color:var(--ink-2)">Pending changes…</span>'):('<span style="color:var(--teal)">✓ Up to date</span>');
+  return `<div class="card" style="margin-top:10px">
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:18px">☁️</span>
+      <div style="flex:1"><div style="font-weight:700;font-size:14px">Cloud backup on</div>
+        <div class="small" style="color:var(--ink-2)">${c.email||''}</div></div>
+      ${st}
+    </div>
+    <div class="small" style="color:var(--mute);margin-top:8px">${last}</div>
+    <div class="rowbtn" style="margin-top:10px">
+      <button class="btn teal" id="cloudSyncBtn">⟳ Sync now</button>
+      <button class="btn ghost" id="cloudSignOutBtn">Sign out</button>
+    </div>
+  </div>`;
+}
+function timeAgo(ms){ const s=Math.round((Date.now()-ms)/1000);
+  if(s<60) return "just now"; if(s<3600) return Math.floor(s/60)+" min ago";
+  if(s<86400) return Math.floor(s/3600)+" h ago"; return Math.floor(s/86400)+" d ago"; }
 function intelCard(){
   const ins=topInsights(2);
   const rows=ins.map(i=>{
@@ -1799,7 +1831,7 @@ let toastT;
 function toast(msg, ok){
   const t=document.getElementById("toast");
   t.textContent=msg; t.className="show"+(ok?" ok":"");
-  if(ok && navigator.vibrate){ try{ navigator.vibrate(12); }catch(e){} }
+  if(ok && navigator.vibrate && (!navigator.userActivation || navigator.userActivation.hasBeenActive)){ try{ navigator.vibrate(12); }catch(e){} }
   clearTimeout(toastT); toastT=setTimeout(()=>t.className="",1900);
 }
 
@@ -1928,7 +1960,8 @@ function VIEW_dash(){
     <button class="btn ghost sm" id="snapBtn" style="width:auto;margin-top:10px">↩ Earlier snapshots</button>
     <input type="file" id="restoreFile" accept="application/json,.json" style="display:none"/>
     <div class="small" style="margin-top:9px">${backed?('✓ Last file backup '+fmtDate(backed)):'⚠ No file backup yet — tap Back up now'}</div>
-  </div>`; })()}
+  </div>
+  ${cloudCard()}`; })()}
 
   <div class="section-h"><h2>Today's Mission</h2><div class="rule"></div></div>
   <div class="card">
@@ -2776,6 +2809,9 @@ function bind(){
     if(a==='recovery') openRecoverySheet();
     else if(a==='backup') doExport(false);
   });
+  const csi=document.getElementById("cloudSignInBtn"); if(csi) csi.onclick=()=>{ const e=document.getElementById("cloudEmail"); cloudSignIn(e?e.value.trim():""); };
+  const csy=document.getElementById("cloudSyncBtn"); if(csy) csy.onclick=()=>cloudSyncNow();
+  const cso=document.getElementById("cloudSignOutBtn"); if(cso) cso.onclick=()=>cloudSignOut();
   document.querySelectorAll("[data-applycal]").forEach(b=>b.onclick=()=>{
     applyCalorie(parseInt(b.dataset.applycal)); toast("Calorie target updated → "+T().cal+" kcal",true); render(); });
   document.querySelectorAll("[data-backup]").forEach(b=>b.onclick=()=>{ const cb=document.getElementById("bkPhotos"); doExport(!!(cb&&cb.checked)); });
@@ -3124,6 +3160,105 @@ function drawMacros(){
   });
 }
 
+/* ============================================================
+   CLOUD SYNC (Supabase) — optional, offline stays source of truth.
+   Dormant until GZ_SB.url is configured. One JSONB state doc per
+   user, last-write-wins by S.updatedAt, checksum-guarded, with an
+   offline push queue. Never blocks the app.
+   ============================================================ */
+const GZ_SB = { url:"", anon:"" };   // filled once the Supabase project exists
+const SB_LIB = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js";
+let sb=null, cloudApplying=false, cloudDirty=false, cloudPushT=null, cloudBusy=false;
+let cloudUser=null, cloudLastSync=null, cloudErr=null;
+function cloudEnabled(){ return !!(GZ_SB.url && GZ_SB.anon); }
+function cloudLoadLib(){
+  return new Promise((res,rej)=>{
+    if(window.supabase) return res(window.supabase);
+    if(window.__GZ_TESTSB){ return res(null); } // test harness injects its own client
+    const s=document.createElement("script"); s.src=SB_LIB; s.async=true;
+    s.onload=()=>res(window.supabase); s.onerror=()=>rej(new Error("lib")); document.head.appendChild(s);
+  });
+}
+function cloudMakeClient(){
+  if(window.__GZ_TESTSB) return window.__GZ_TESTSB;
+  return window.supabase.createClient(GZ_SB.url, GZ_SB.anon, {auth:{persistSession:true, autoRefreshToken:true, storageKey:"grizzly.auth"}});
+}
+async function cloudInit(){
+  if(!cloudEnabled() && !window.__GZ_TESTSB) return;
+  try{
+    await cloudLoadLib();
+    sb=cloudMakeClient();
+    const {data}=await sb.auth.getSession();
+    cloudUser = data && data.session ? data.session.user : null;
+    sb.auth.onAuthStateChange((_e,session)=>{
+      cloudUser = session? session.user : null;
+      if(route==="dash") render();
+      if(cloudUser) cloudPull();
+    });
+    if(cloudUser) await cloudPull();
+    if(route==="dash") render();
+  }catch(e){ cloudErr="init"; }
+}
+async function cloudSignIn(email){
+  if(!sb||!email) return;
+  cloudErr=null;
+  try{ const {error}=await sb.auth.signInWithOtp({email, options:{emailRedirectTo:location.href.split('#')[0]}});
+    if(error) throw error; toast("Check your email for the sign-in link",true);
+  }catch(e){ cloudErr="signin"; toast("Couldn't send the sign-in link"); }
+}
+async function cloudSignOut(){ if(sb){ try{ await sb.auth.signOut(); }catch(e){} } cloudUser=null; if(route==="dash") render(); }
+async function cloudPull(){
+  if(!sb||!cloudUser) return;
+  cloudBusy=true;
+  try{
+    const {data,error}=await sb.from("grizzly_state").select("state,updated_at,checksum").eq("user_id",cloudUser.id).maybeSingle();
+    if(error) throw error;
+    if(data && data.state){
+      const remote=data.state;
+      const rsum=checksum(JSON.stringify(remote));
+      if(data.checksum && data.checksum!==rsum){ cloudErr="integrity"; cloudBusy=false; return; } // corrupt remote — don't adopt
+      const localSum=checksum(JSON.stringify(S));
+      if(rsum===localSum){ cloudLastSync=Date.now(); cloudBusy=false; if(route==="dash")render(); return; } // already identical
+      const rU=remote.updatedAt||0, lU=S.updatedAt||0;
+      const localEmpty=!hasData(S);
+      if(localEmpty || rU>lU){
+        cloudApplying=true; S=migrate(remote); save(); cloudApplying=false;
+        cloudLastSync=Date.now(); render(); toast("Synced from cloud",true);
+      } else {
+        await cloudPush(); // local is newer — push it up
+      }
+    } else {
+      await cloudPush(); // no remote row yet — seed it
+    }
+  }catch(e){ cloudErr="pull"; cloudDirty=true; }
+  cloudBusy=false;
+}
+async function cloudPush(){
+  if(!sb||!cloudUser) return;
+  cloudBusy=true;
+  try{
+    const sum=checksum(JSON.stringify(S));
+    const row={ user_id:cloudUser.id, state:S, schema_version:S.schemaVersion, checksum:sum,
+      device:(navigator.platform||"device"), updated_at:new Date().toISOString() };
+    const {error}=await sb.from("grizzly_state").upsert(row,{onConflict:"user_id"});
+    if(error) throw error;
+    cloudDirty=false; cloudLastSync=Date.now(); cloudErr=null;
+  }catch(e){ cloudErr="push"; cloudDirty=true; }
+  cloudBusy=false;
+  if(route==="dash") render();
+}
+function cloudPushDebounced(){
+  if(!cloudEnabled() && !window.__GZ_TESTSB) return;
+  if(!sb||!cloudUser){ cloudDirty=true; return; }
+  clearTimeout(cloudPushT); cloudPushT=setTimeout(()=>{ cloudPush(); }, 3500);
+}
+async function cloudSyncNow(){ if(!sb||!cloudUser){ toast("Sign in to sync"); return; } await cloudPull(); if(cloudDirty) await cloudPush(); toast("Synced",true); }
+function cloudStatus(){
+  if(!cloudEnabled() && !window.__GZ_TESTSB) return {state:"off"};
+  if(!cloudUser) return {state:"signedout"};
+  return {state:"on", email:cloudUser.email, lastSync:cloudLastSync, dirty:cloudDirty, err:cloudErr};
+}
+
 /* ---------- boot ---------- */
 if(!ROUTES.includes(route)) route="dash";
 render();
@@ -3132,6 +3267,8 @@ render();
 if(!hasData(S) && ('indexedDB' in window)){
   vaultLoad().then(v=>{ if(hasData(v)){ S=migrate(v); save(); render(); toast("Recovered your data from on-device backup",true); } });
 } else { scheduleVault(); }
+cloudInit();
+window.addEventListener("online",()=>{ if(cloudDirty) cloudPush(); });
 window.addEventListener("resize",()=>{ if(route==="dash")drawSpark(); if(route==="fuel")drawMacros(); if(route==="progress")drawProgress(); });
 
 /* offline indicator */
