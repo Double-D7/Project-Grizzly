@@ -385,6 +385,21 @@ nav.dock button.on:after{content:"";position:absolute;top:-8px;width:22px;height
 .rdy-badge{flex:0 0 auto;width:30px;height:30px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;background:rgba(255,255,255,.06);color:var(--ink);font-family:var(--disp)}
 .rdy-strip.good .rdy-badge{color:var(--teal)} .rdy-strip.warn .rdy-badge{color:var(--warn)}
 .rc-empty{border-color:rgba(139,92,246,.3)}
+/* Stage 6 — smart reminders */
+.remind{display:flex;align-items:center;gap:10px;background:linear-gradient(180deg,rgba(139,92,246,.16),rgba(139,92,246,.05));border:1px solid rgba(139,92,246,.4);border-radius:14px;padding:10px 12px;margin-bottom:12px}
+.rm-ic{font-size:18px;flex:0 0 auto}
+.rm-tx{flex:1;min-width:0}
+.rm-m{font-size:13px;font-weight:600;color:var(--ink);line-height:1.3}
+.rm-more{font-size:10.5px;color:var(--ink-2);margin-top:1px}
+.rm-go{flex:0 0 auto;background:var(--purple);color:#fff;border:0;border-radius:9px;padding:7px 12px;font-size:12px;font-weight:700}
+.rm-go:active{filter:brightness(.92)}
+.rm-x{flex:0 0 auto;background:transparent;border:0;color:var(--ink-2);font-size:20px;line-height:1;padding:2px 4px;width:28px}
+/* Stage 6 — premium polish: view transition + keyboard focus */
+@media (prefers-reduced-motion: no-preference){
+  main{animation:viewIn .22s ease both}
+  @keyframes viewIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+}
+button:focus-visible,select:focus-visible,input:focus-visible,textarea:focus-visible,a:focus-visible{outline:2px solid var(--purple);outline-offset:2px;border-radius:8px}
 .exhead .rest{margin-left:auto;background:transparent;border:1px solid var(--line);color:var(--ink-2);border-radius:8px;padding:5px 9px;font-size:11px;font-weight:700;display:inline-flex;gap:5px;align-items:center}
 .exhead .rest:active{background:var(--panel-2)}
 #restbar{position:fixed;left:50%;transform:translateX(-50%) translateY(24px);bottom:calc(88px + var(--safe-b));z-index:70;
@@ -1597,6 +1612,33 @@ function rcSlider(id,label,min,max,val,lo,hi){
     <input type="range" id="${id}" min="${min}" max="${max}" value="${val}" step="1"/>
     <div class="rc-ends"><span>${lo}</span><span>${hi}</span></div></div>`;
 }
+/* ---------- Smart in-app reminders (Stage 6) ---------- */
+function remDismiss(){ try{ return JSON.parse(localStorage.getItem('grizzly.remDismiss')||'{}'); }catch(e){ return {}; } }
+function dismissReminder(id){ const d=remDismiss(); d[id]=todayISO(); try{ localStorage.setItem('grizzly.remDismiss', JSON.stringify(d)); }catch(e){} }
+function activeReminders(){
+  const today=todayISO(), now=new Date(), hr=now.getHours(), dow=DOW[now.getDay()], t=T();
+  const out=[];
+  if(S.weights[today]==null) out.push({id:'weigh', icon:'⚖', text:"Log this morning's weight", go:'weigh', pr:hr<13?5:2});
+  if(!todayRecovery()) out.push({id:'readiness', icon:'🧭', text:"Check in today's readiness", act:'recovery', pr:4});
+  const lastCi=latestCheckin(), daysCi=lastCi?(dnum(today)-dnum(lastCi.date)):999;
+  if(dow==='sun' && daysCi>=6) out.push({id:'checkin', icon:'📋', text:'Your Sunday check-in is due', go:'check', pr:6});
+  const bk=S.lastBackup, daysBk=bk?(dnum(today)-dnum(bk)):999;
+  if(daysBk>=14) out.push({id:'backup', icon:'💾', text: bk?('Back up your data — last saved '+fmtDate(bk)):'Back up your data to Files / iCloud', act:'backup', pr:bk?2:3});
+  if(hr>=18){ const n=S.nutrition[today], pEaten=n?(n.protein||0):0;
+    if(pEaten < t.protein*0.7) out.push({id:'protein', icon:'🥩', text:`Protein's behind — ${Math.max(0,Math.round(t.protein-pEaten))} g to reach ${t.protein}`, go:'fuel', pr:3}); }
+  const dis=remDismiss();
+  return out.filter(r=>dis[r.id]!==today).sort((a,b)=>b.pr-a.pr);
+}
+function reminderBanner(){
+  const rem=activeReminders(); if(!rem.length) return '';
+  const r=rem[0], more=rem.length-1;
+  return `<div class="remind" data-remind-id="${r.id}">
+    <span class="rm-ic">${r.icon}</span>
+    <div class="rm-tx"><div class="rm-m">${r.text}</div>${more>0?`<div class="rm-more">+${more} more reminder${more>1?'s':''}</div>`:''}</div>
+    <button class="rm-go" ${r.go?`data-remind-go="${r.go}"`:''} ${r.act?`data-remind-act="${r.act}"`:''}>Do it</button>
+    <button class="rm-x" data-remind-dismiss="${r.id}" aria-label="dismiss">×</button>
+  </div>`;
+}
 function intelCard(){
   const ins=topInsights(2);
   const rows=ins.map(i=>{
@@ -1757,6 +1799,7 @@ let toastT;
 function toast(msg, ok){
   const t=document.getElementById("toast");
   t.textContent=msg; t.className="show"+(ok?" ok":"");
+  if(ok && navigator.vibrate){ try{ navigator.vibrate(12); }catch(e){} }
   clearTimeout(toastT); toastT=setTimeout(()=>t.className="",1900);
 }
 
@@ -1806,8 +1849,8 @@ function header(){
 }
 function dock(){
   const items=[["dash","Dash"],["weigh","Weigh"],["train","Train"],["fuel","Fuel"],["progress","Progress"],["check","Check"],["book","Book"]];
-  return `<nav class="dock">${items.map(([r,l])=>
-    `<button data-go="${r}" class="${route===r?"on":""}"><svg viewBox="0 0 24 24">${IC[r]}</svg>${l}</button>`).join("")}</nav>`;
+  return `<nav class="dock" role="tablist" aria-label="Sections">${items.map(([r,l])=>
+    `<button data-go="${r}" class="${route===r?"on":""}" role="tab" aria-label="${l}" aria-current="${route===r?'page':'false'}"><svg viewBox="0 0 24 24" aria-hidden="true">${IC[r]}</svg>${l}</button>`).join("")}</nav>`;
 }
 
 /* ---------- DASHBOARD ---------- */
@@ -1832,6 +1875,7 @@ function VIEW_dash(){
   const mealsDone=Object.values(nToday.meals||{}).filter(Boolean).length;
 
   return `
+  ${reminderBanner()}
   <div class="card hero">
     <div class="row">
       <div>
@@ -2725,6 +2769,13 @@ function bind(){
   document.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>go(b.dataset.go));
   const dbb=document.getElementById("debriefBtn"); if(dbb) dbb.onclick=()=>openDebrief();
   const lrb=document.getElementById("logRecovery"); if(lrb) lrb.onclick=()=>openRecoverySheet();
+  document.querySelectorAll("[data-remind-dismiss]").forEach(b=>b.onclick=()=>{ dismissReminder(b.dataset.remindDismiss); render(); });
+  document.querySelectorAll("[data-remind-go]").forEach(b=>b.onclick=()=>go(b.dataset.remindGo));
+  document.querySelectorAll("[data-remind-act]").forEach(b=>b.onclick=()=>{
+    const a=b.dataset.remindAct;
+    if(a==='recovery') openRecoverySheet();
+    else if(a==='backup') doExport(false);
+  });
   document.querySelectorAll("[data-applycal]").forEach(b=>b.onclick=()=>{
     applyCalorie(parseInt(b.dataset.applycal)); toast("Calorie target updated → "+T().cal+" kcal",true); render(); });
   document.querySelectorAll("[data-backup]").forEach(b=>b.onclick=()=>{ const cb=document.getElementById("bkPhotos"); doExport(!!(cb&&cb.checked)); });
