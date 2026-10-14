@@ -323,6 +323,29 @@ nav.dock button.on:after{content:"";position:absolute;top:-8px;width:22px;height
 .lastset{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--mute);margin:2px 0 8px}
 .lastset b{color:var(--teal);font-weight:700}
 .lastset .beat{margin-left:auto;color:var(--purple);font-weight:700;letter-spacing:.03em}
+/* Stage 3 — progression targets, decline flag, volume, deload, swap, completion */
+.nextset{font-size:11.5px;color:var(--teal);font-weight:600;margin:-4px 0 8px;display:flex;gap:6px;align-items:center}
+.declflag{color:var(--warn);font-weight:800;font-size:13px}
+.deload{background:linear-gradient(180deg,rgba(245,158,66,.14),rgba(245,158,66,.05));border:1px solid rgba(245,158,66,.45);border-radius:14px;padding:12px 14px;margin-bottom:12px}
+.deload .dl-h{font-weight:800;color:var(--warn);font-size:13px;letter-spacing:.02em}
+.deload .dl-b{font-size:12px;color:var(--ink-2);margin-top:4px;line-height:1.5}
+.mg-row{display:flex;align-items:center;gap:10px;padding:5px 0}
+.mg-n{width:92px;font-size:12.5px;color:var(--ink);font-weight:600}
+.mg-bar{flex:1;height:8px;background:var(--panel-2);border-radius:6px;overflow:hidden}
+.mg-fill{height:100%;background:linear-gradient(90deg,var(--purple),var(--teal));border-radius:6px}
+.mg-v{min-width:56px;text-align:right;font-size:12px;font-weight:700;color:var(--ink-2)}
+.swap-opt{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:11px 12px;margin-bottom:8px;color:var(--ink);font-size:13.5px}
+.swap-opt:active{border-color:var(--purple)}
+.swap-opt .nm{flex:1}
+.swap-opt .tag{font-size:10px;font-weight:700;color:var(--mute)}
+.cs-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+.cs-tile{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:12px;text-align:center}
+.cs-n{font-family:var(--disp);font-size:24px;font-weight:700;color:var(--teal)}
+.cs-l{font-size:11px;color:var(--mute);letter-spacing:.04em;text-transform:uppercase;margin-top:2px}
+.cs-pr{background:linear-gradient(180deg,rgba(139,92,246,.18),rgba(139,92,246,.05));border:1px solid rgba(139,92,246,.5);border-radius:12px;padding:10px 12px;font-weight:700;color:var(--purple);text-align:center;margin-bottom:12px}
+.cs-sec{margin-bottom:4px}
+.cs-beat{font-size:12.5px;color:var(--ink);padding:4px 0}
+.cs-beat .small{color:var(--mute)}
 .exhead .rest{margin-left:auto;background:transparent;border:1px solid var(--line);color:var(--ink-2);border-radius:8px;padding:5px 9px;font-size:11px;font-weight:700;display:inline-flex;gap:5px;align-items:center}
 .exhead .rest:active{background:var(--panel-2)}
 #restbar{position:fixed;left:50%;transform:translateX(-50%) translateY(24px);bottom:calc(88px + var(--safe-b));z-index:70;
@@ -894,12 +917,13 @@ const todayISO = () => new Date().toISOString().slice(0,10);
 const fmtDate = iso => { const [y,m,d]=iso.split("-"); return new Date(y,m-1,d).toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"}); };
 
 /* ---------- versioned schema + safe, non-destructive migrations ---------- */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
+const DEFAULT_SETTINGS={upperInc:5,lowerInc:10,rpeCap:9,restDefault:120};
 function fresh(){
   return { schemaVersion:SCHEMA_VERSION, operator:OPERATOR, startDate:todayISO(),
     weights:{}, workouts:[], nutrition:{}, checkins:[], prs:{}, prHistory:[], groceryChecked:{},
     targets:{cal:TARGETS.cal,protein:TARGETS.protein,carbs:TARGETS.carbs,fat:TARGETS.fat},
-    adjustLog:[], mealWeek:0, debriefs:[] };
+    adjustLog:[], mealWeek:0, debriefs:[], settings:Object.assign({},DEFAULT_SETTINGS) };
 }
 /* Fill missing fields without ever discarding existing data. Returns s. */
 function normalizeState(s){
@@ -917,6 +941,8 @@ function normalizeState(s){
   if(!Array.isArray(s.adjustLog)) s.adjustLog=[];
   if(typeof s.mealWeek!=='number') s.mealWeek=0;
   if(!Array.isArray(s.debriefs)) s.debriefs=[];
+  if(!s.settings || typeof s.settings!=='object') s.settings=Object.assign({},DEFAULT_SETTINGS);
+  else { for(const k in DEFAULT_SETTINGS){ if(typeof s.settings[k]!=='number') s.settings[k]=DEFAULT_SETTINGS[k]; } }
   return s;
 }
 /* Ordered migrations. Every step preserves existing records. */
@@ -925,6 +951,7 @@ function migrate(s){
   let v = (typeof s.schemaVersion==='number') ? s.schemaVersion : 1;
   if(v<2){ v=2; } // v1 -> v2: adds schemaVersion; fields ensured above; no data touched
   if(v<3){ v=3; } // v2 -> v3: adds debriefs[] (Grizzly Weekly Debrief history)
+  if(v<4){ v=4; } // v3 -> v4: adds settings{} (progression increments, RPE cap, rest)
   s.schemaVersion = SCHEMA_VERSION;
   return s;
 }
@@ -1709,6 +1736,96 @@ function VIEW_weigh(){
 }
 
 /* ---------- TRAIN ---------- */
+/* ============================================================
+   ADVANCED TRAINING ENGINE — double progression, substitutions,
+   muscle-group volume/frequency, deload logic. Back-safety respected.
+   ============================================================ */
+const MUSCLE={
+ "Incline DB Press":["Chest"],"Flat Barbell Bench Press":["Chest"],"Flat DB Fly":["Chest"],"Barbell Bench Press":["Chest"],"Flat DB Press":["Chest"],
+ "Dips (power tower)":["Chest","Triceps"],"Dips":["Chest","Triceps"],
+ "Seated DB Shoulder Press":["Shoulders"],"DB Lateral Raise":["Shoulders"],"Chest-Supported Rear Delt Fly":["Shoulders"],"DB Shrugs":["Back"],
+ "Overhead DB Extension":["Triceps"],
+ "Lat Pulldown":["Back"],"Chest-Supported DB Row":["Back"],"One-Arm DB Row":["Back"],"Straight-Arm Pulldown":["Back"],"Weighted Pull-Ups":["Back"],
+ "Preacher Curl":["Biceps"],"Incline DB Curl":["Biceps"],"DB Hammer Curl":["Biceps"],
+ "Goblet Squat":["Quads"],"DB Bulgarian Split Squat":["Quads","Glutes"],"DB Reverse Lunge":["Quads","Glutes"],"DB Walking Lunge":["Quads","Glutes"],"Leg Extension":["Quads"],
+ "Lying Leg Curl":["Hamstrings"],"Seated Leg Curl":["Hamstrings"],
+ "DB Calf Raise":["Calves"],
+ "Bird Dogs":["Core"],"McGill Curl-Ups":["Core"],"Side Planks":["Core"],"Dead Bug":["Core"],"DB Suitcase Carry":["Core"],
+ "DB Farmer Carry":["Conditioning"],"Sled Push":["Conditioning"],"Treadmill Incline Intervals":["Conditioning"],"Treadmill Incline Push":["Conditioning"],"Sandbag Carry":["Conditioning"]
+};
+function muscleOf(name){ if(MUSCLE[name]) return MUSCLE[name];
+  const n=(name||"").toLowerCase();
+  if(/leg ext/.test(n)) return ["Quads"];
+  if(/leg curl|hamstring|rdl|romanian|nordic|glute-?ham/.test(n)) return ["Hamstrings"];
+  if(/squat|lunge|leg press|step-?up|hack|belt squat/.test(n)) return ["Quads"];
+  if(/calf|calves/.test(n)) return ["Calves"];
+  if(/pulldown|\brow\b|pull-?up|chin|pullover|shrug/.test(n)) return ["Back"];
+  if(/curl/.test(n)) return ["Biceps"];
+  if(/lateral|rear delt|shoulder press|\bohp\b|arnold|overhead press|\braise\b/.test(n)) return ["Shoulders"];
+  if(/triceps|pushdown|skull|kickback|\bdip/.test(n)) return ["Triceps"];
+  if(/bench|chest|\bfly\b|push-?up|incline press|flat press/.test(n)) return ["Chest"];
+  if(/plank|bird dog|dead bug|pallof|crunch|\bcore\b|suitcase/.test(n)) return ["Core"];
+  if(/carry|sled|prowler|rope|treadmill|cardio|conditioning|battle/.test(n)) return ["Conditioning"];
+  return ["Other"];
+}
+const ALT={
+ Chest:[["Incline DB Press","g"],["Flat DB Press","g"],["Flat Barbell Bench Press","g"],["Flat DB Fly","g"],["Dips (power tower)","g"],["Push-Ups","g"],["Incline Barbell Bench","y"]],
+ Shoulders:[["Seated DB Shoulder Press","g"],["DB Lateral Raise","g"],["Chest-Supported Rear Delt Fly","g"],["Arnold Press (seated)","g"],["DB Front Raise","g"]],
+ Triceps:[["Overhead DB Extension","g"],["Dips (power tower)","g"],["DB Skull Crusher","g"],["Bench Dips","g"]],
+ Back:[["Lat Pulldown","g"],["Chest-Supported DB Row","g"],["One-Arm DB Row","g"],["Straight-Arm Pulldown","g"],["Weighted Pull-Ups","y"]],
+ Biceps:[["Preacher Curl","g"],["Incline DB Curl","g"],["DB Hammer Curl","y"],["EZ Bar Curl","y"],["Concentration Curl","g"]],
+ Quads:[["Goblet Squat","y"],["DB Bulgarian Split Squat","y"],["DB Reverse Lunge","y"],["Leg Extension","g"],["DB Step-Up","y"],["Belt Squat","g"]],
+ Hamstrings:[["Lying Leg Curl","g"],["Seated Leg Curl","g"],["DB Romanian Deadlift","y"],["Glute-Ham Raise","y"]],
+ Glutes:[["DB Hip Thrust","g"],["DB Reverse Lunge","y"],["DB Bulgarian Split Squat","y"],["DB Step-Up","y"]],
+ Calves:[["DB Calf Raise","g"],["Standing Calf Raise","g"],["Seated Calf Raise","g"]],
+ Core:[["Bird Dogs","g"],["McGill Curl-Ups","g"],["Side Planks","g"],["Dead Bug","g"],["Pallof Press","g"],["Hanging Knee Raise","g"]],
+ Conditioning:[["DB Farmer Carry","y"],["Sled Push","g"],["Treadmill Incline Intervals","g"],["Battle Ropes","g"],["DB Suitcase Carry","y"]],
+ Other:[]
+};
+function subsFor(name){ const g=muscleOf(name)[0]; return (ALT[g]||[]).filter(a=>a[0]!==name).slice(0,6); }
+function parseScheme(scheme){ if(!scheme) return null;
+  const m=String(scheme).match(/(\d+)\s*[×x]\s*(\d+)(?:\s*[–-]\s*(\d+))?/);
+  if(!m) return null; const sets=+m[1], low=+m[2], high=m[3]?+m[3]:+m[2]; return {sets,low,high}; }
+function progInc(name){ const s=S.settings||DEFAULT_SETTINGS;
+  return /squat|lunge|leg press|deadlift|hack|belt|hip thrust|rdl|romanian/i.test(name) ? (s.lowerInc||10) : (s.upperInc||5); }
+function computeNext(name, scheme, rawSets){
+  const sch=parseScheme(scheme); if(!sch) return null;
+  const sets=(rawSets||[]).map(s=>({w:parseFloat(s.w),r:parseInt(s.r),rpe:parseFloat(s.rpe)})).filter(s=>s.w>0&&s.r>0);
+  if(!sets.length) return null;
+  const topW=Math.max(...sets.map(s=>s.w)), working=sets.filter(s=>s.w>=topW-0.01);
+  const rpeCap=(S.settings&&S.settings.rpeCap)||9, rpeOk=working.every(s=>isNaN(s.rpe)||s.rpe<=rpeCap), inc=progInc(name);
+  if(sch.high>sch.low){
+    if(working.length>=sch.sets && working.every(s=>s.r>=sch.high) && rpeOk)
+      return {type:"load", w:round1(topW+inc), r:sch.low, msg:`+${inc} lb → ${round1(topW+inc)}×${sch.low} (you hit the top of the range)`};
+    const bestR=Math.max(...working.map(s=>s.r)), tr=Math.min(sch.high,(bestR||sch.low)+1);
+    return {type:"rep", w:topW, r:tr, msg:`${topW}×${tr} — one more rep toward ${sch.high}`};
+  }
+  if(working.length>=sch.sets && working.every(s=>s.r>=sch.low) && rpeOk)
+    return {type:"load", w:round1(topW+inc), r:sch.low, msg:`+${inc} lb → ${round1(topW+inc)}×${sch.low} (all sets hit)`};
+  return {type:"hold", w:topW, r:sch.low, msg:`Repeat ${topW}×${sch.low} — nail all ${sch.sets} sets`};
+}
+function nextTarget(name, scheme){ const last=lastSession(name); return last? computeNext(name,scheme,last.sets):null; }
+function declineFlag(name){ const s=strengthSeries(name); if(s.length<3) return false;
+  const slope=linReg(s.slice(-4).map(p=>({x:dnum(p.t),y:p.v}))); return slope!=null && slope< -0.4; }
+function weekVolume(){
+  const since=dnum(todayISO())-6, vol={}, days={};
+  S.workouts.filter(w=>dnum(w.date)>=since).forEach(w=>{
+    const touched=new Set();
+    (w.exercises||[]).forEach(e=>{ const n=(e.sets||[]).filter(s=>parseFloat(s.w)>0||parseInt(s.r)>0).length;
+      if(!n) return; muscleOf(e.name).forEach(g=>{ vol[g]=(vol[g]||0)+n; touched.add(g); }); });
+    touched.forEach(g=>{ (days[g]=days[g]||new Set()).add(w.date); });
+  });
+  return Object.keys(vol).map(g=>({group:g,sets:vol[g],days:days[g]?days[g].size:0})).sort((a,b)=>b.sets-a.sets);
+}
+function deloadSuggest(){
+  const reasons=[]; const rec=recoveryIntel(), str=strengthIntel();
+  if(rec.tone==="warn") reasons.push("recovery is flagged");
+  if(str.plateau) reasons.push(`${str.plateau.name} has plateaued`);
+  const declining=BENCHMARKS.find(declineFlag); if(declining) reasons.push(`${declining} is trending down`);
+  const total=weekVolume().reduce((a,b)=>a+b.sets,0); if(total>=90) reasons.push("weekly set volume is high");
+  return {suggest:reasons.length>=2, reasons};
+}
+
 let trainDay = DOW[new Date().getDay()];
 let plateOpen=false, plateWeight="", plateBar=45;
 function currentWorkout(iso, key){
@@ -1718,6 +1835,9 @@ function VIEW_train(){
   const iso=todayISO();
   const wk=SPLIT.find(s=>s.key===trainDay);
   let session=currentWorkout(iso,trainDay);
+  const isRest = (trainDay==="sun" || trainDay==="thu");
+  const dl = deloadSuggest();
+  const vol = weekVolume();
 
   const dayBtns = SPLIT.map(s=>{
     const isToday=s.key===DOW[new Date().getDay()];
@@ -1733,15 +1853,33 @@ function VIEW_train(){
       <p class="hint" style="margin:12px 0 0">${wk.cardio}. ${trainDay==="sun"?"Rest is part of the program — recover hard so you train hard.":"Nothing heroic. Move, breathe, protect the spine."}</p>
     </div>`;
   } else {
-    const ex = (session? session.exercises : wk.ex.map(e=>({name:e[0],scheme:e[1],rating:e[2],sets:[blankSet()],note:""})));
+    ensureDraft();                 // render from the live draft so edits/swaps/copies persist
+    const ex = draft.exercises;
     body = ex.map((e,ei)=>exerciseCard(e,ei,session)).join("") + `
+      <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+        <button class="btn sm ghost" id="copyLast">⟳ Copy last session</button>
+        <button class="btn sm ghost" id="addExercise">+ Add exercise</button>
+        <button class="btn sm ghost" id="trainSettings">⚙ Progression</button>
+      </div>
       <button class="btn ${session?'':'primary'}" id="saveWorkout" style="margin-top:14px">${session?"Update session":"Save session"}</button>
       ${session?`<p class="hint" style="text-align:center;margin-top:10px">Saved ${fmtDate(session.date)} · PRs auto-detected on save</p>`:""}`;
   }
 
+  const deloadBanner = dl.suggest
+    ? `<div class="deload"><div class="dl-h">⚠ Deload suggested</div><div class="dl-b">${dl.reasons.join(" · ")}. Consider a lighter week — drop volume ~40% or take intensity down a notch. Advisory only; you decide.</div></div>`
+    : "";
+  const volCard = vol.length
+    ? `<div class="card" style="margin-bottom:12px">
+        <div class="label" style="margin-bottom:10px">This Week · Muscle Volume <span class="small" style="color:var(--ink-2)">(working sets, last 7 days)</span></div>
+        ${vol.map(v=>`<div class="mg-row"><div class="mg-n">${v.group}</div><div class="mg-bar"><div class="mg-fill" style="width:${Math.min(100,Math.round(v.sets/22*100))}%"></div></div><div class="mg-v">${v.sets} <span class="small">· ${v.days}×</span></div></div>`).join("")}
+      </div>`
+    : "";
+
   return `
   <div class="section-h"><h2>Training</h2><span class="badge">Foundation</span><div class="rule"></div></div>
+  ${deloadBanner}
   <div class="days">${dayBtns}</div>
+  ${isRest?"":volCard}
   <div class="card" style="margin-bottom:12px">
     <div style="display:flex;justify-content:space-between;align-items:center">
       <div><div class="display" style="font-size:22px">${wk.title}</div><div class="small">${wk.sub}</div></div>
@@ -1780,10 +1918,13 @@ function exerciseCard(e,ei,session){
   const pr=S.prs[e.name];
   const last=lastSession(e.name);
   const lb = last && last.best ? last.best : null;
+  const nt = nextTarget(e.name, e.scheme);   // double-progression recommendation
+  const decl = declineFlag(e.name);
+  const restSec=(S.settings&&S.settings.restDefault)||120;
   const setsHtml=e.sets.map((s,si)=>{
-    // suggest last week's matching set (by index), else its best set, as placeholder
     const ref = last ? (last.sets[si]||last.best) : null;
-    const wp = ref&&ref.w? ref.w : "lb", rp = ref&&ref.r? ref.r : "reps";
+    const wp = nt? nt.w : (ref&&ref.w? ref.w : "lb");
+    const rp = nt? nt.r : (ref&&ref.r? ref.r : "reps");
     return `
     <div class="setrow" data-ex="${ei}" data-set="${si}">
       <div class="sn">${si+1}</div>
@@ -1795,19 +1936,22 @@ function exerciseCard(e,ei,session){
   const lastLine = lb
     ? `<div class="lastset">Last · <b>${lb.w} lb × ${lb.r}</b> <span class="small">(${fmtDate(last.date)})</span><span class="beat">▲ beat it</span></div>`
     : `<div class="lastset">First time logging — set the benchmark</div>`;
+  const nextLine = nt ? `<div class="nextset">▶ Target: ${nt.msg}</div>` : "";
   return `<div class="card" data-excard="${ei}">
     <div class="exhead">
       <span class="dot ${e.rating}" title="${RTXT[e.rating]}"></span>
-      <span class="nm">${e.name}</span>
+      <span class="nm">${e.name}${decl?' <span class="declflag" title="e1RM trending down">↓</span>':''}</span>
       <span class="scheme">${e.scheme}</span>
-      <button class="rest" data-rest="120">⏱ Rest</button>
+      <button class="rest" data-rest="${restSec}">⏱ Rest</button>
     </div>
     ${lastLine}
+    ${nextLine}
     ${pr?`<div class="prev">PR · ${pr.w} lb × ${pr.r}  (e1RM ${pr.e1rm})</div>`:`<div class="prev">No PR logged yet</div>`}
     ${setsHtml}
-    <div style="display:flex;gap:10px;margin-top:10px">
-      <button class="btn sm ghost" data-addset="${ei}">+ Add set</button>
-      <button class="btn sm ghost" data-rest="90">⏱ 90s rest</button>
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      <button class="btn sm ghost" data-addset="${ei}">+ Set</button>
+      <button class="btn sm ghost" data-rest="90">⏱ 90s</button>
+      <button class="btn sm ghost" data-swap="${ei}">⇄ Swap</button>
     </div>
     <textarea data-note="${ei}" placeholder="Notes — form cues, how the back felt, substitutions…" style="margin-top:10px">${e.note||""}</textarea>
   </div>`;
@@ -1816,11 +1960,13 @@ function exerciseCard(e,ei,session){
 let draft = null;
 function ensureDraft(){
   const iso=todayISO();
+  // keep in-progress edits (swaps, copies, added sets/exercises) across re-renders
+  if(draft && draft.key===trainDay && draft.date===iso) return;
   const wk=SPLIT.find(s=>s.key===trainDay);
   const existing=currentWorkout(iso,trainDay);
   draft = existing
     ? JSON.parse(JSON.stringify(existing))
-    : { id:"w"+Date.now(), date:iso, key:trainDay, title:wk.title, exercises: wk.ex.map(e=>({name:e[0],scheme:e[1],rating:e[2],sets:[blankSet()],note:""})) };
+    : { id:"w"+Date.now(), date:iso, key:trainDay, title:wk.title, startedAt:Date.now(), exercises: wk.ex.map(e=>({name:e[0],scheme:e[1],rating:e[2],sets:[blankSet()],note:""})) };
 }
 
 /* ---------- FUEL ---------- */
@@ -2294,6 +2440,10 @@ function bindTrain(){
     if(draft.exercises[ei].sets.length>1) draft.exercises[ei].sets.splice(si,1);
     rerenderTrainBody();
   });
+  document.querySelectorAll("[data-swap]").forEach(b=>b.onclick=()=>openSwapSheet(+b.dataset.swap));
+  const cl=document.getElementById("copyLast"); if(cl) cl.onclick=copyLastSession;
+  const ae=document.getElementById("addExercise"); if(ae) ae.onclick=openAddExercise;
+  const ts=document.getElementById("trainSettings"); if(ts) ts.onclick=openTrainSettings;
   const sv=document.getElementById("saveWorkout");
   if(sv) sv.onclick=saveWorkout;
 }
@@ -2325,8 +2475,125 @@ function saveWorkout(){
   const idx=S.workouts.findIndex(w=>w.id===clean.id || (w.date===clean.date&&w.key===clean.key));
   if(idx>=0) S.workouts[idx]=clean; else S.workouts.push(clean);
   save();
-  toast(prCount?("Session saved · "+prCount+" new PR"+(prCount>1?"s":"")+" 🔥"):"Session saved",true);
+  openCompletionSheet(clean, prCount);
   draft=null; render();
+}
+/* ---------- STAGE 3 sheets & helpers ---------- */
+function openCompletionSheet(w, prCount){
+  let totalSets=0, totalVol=0, totalReps=0; const beats=[];
+  w.exercises.forEach(e=>{
+    const prev=lastSessionBefore(e.name, w.id);
+    let best=null;
+    e.sets.forEach(s=>{
+      const wt=parseFloat(s.w), r=parseInt(s.r);
+      if(wt>0&&r>0){ totalSets++; totalReps+=r; totalVol+=wt*r; if(!best||e1rm(wt,r)>e1rm(best.w,best.r)) best={w:wt,r}; }
+    });
+    if(best && prev && prev.best && e1rm(best.w,best.r) > e1rm(prev.best.w,prev.best.r)){
+      beats.push(`${e.name}: ${best.w}×${best.r} <span class="small">(was ${prev.best.w}×${prev.best.r})</span>`);
+    }
+  });
+  const mins = w.startedAt ? Math.max(1,Math.round((Date.now()-w.startedAt)/60000)) : null;
+  const html=`
+    <h3 style="margin:0 0 4px">Session complete ${prCount?'🔥':'✓'}</h3>
+    <p class="small" style="color:var(--ink-2);margin:0 0 14px">${w.title} · ${fmtDate(w.date)}</p>
+    <div class="cs-grid">
+      <div class="cs-tile"><div class="cs-n">${totalSets}</div><div class="cs-l">sets</div></div>
+      <div class="cs-tile"><div class="cs-n">${Math.round(totalVol).toLocaleString()}</div><div class="cs-l">lb volume</div></div>
+      <div class="cs-tile"><div class="cs-n">${totalReps}</div><div class="cs-l">reps</div></div>
+      ${mins?`<div class="cs-tile"><div class="cs-n">${mins}</div><div class="cs-l">minutes</div></div>`:''}
+    </div>
+    ${prCount?`<div class="cs-pr">🏆 ${prCount} new personal record${prCount>1?'s':''}</div>`:''}
+    ${beats.length?`<div class="cs-sec"><div class="label" style="margin-bottom:6px">Beat last time</div>${beats.map(b=>`<div class="cs-beat">▲ ${b}</div>`).join("")}</div>`:`<div class="cs-sec"><p class="small" style="color:var(--ink-2)">Logged and locked in. Consistency is the lever.</p></div>`}
+    <button class="btn primary" onclick="closeSheet()" style="margin-top:14px">Done</button>`;
+  showSheet(html);
+}
+function lastSessionBefore(name, excludeId){
+  const rows=S.workouts.filter(w=>w.id!==excludeId).sort((a,b)=>a.date<b.date?1:-1);
+  for(const w of rows){
+    const ex=w.exercises.find(e=>e.name===name);
+    if(ex){ let best=null; ex.sets.forEach(s=>{const wt=parseFloat(s.w),r=parseInt(s.r); if(wt>0&&r>0&&(!best||e1rm(wt,r)>e1rm(best.w,best.r))) best={w:wt,r};}); if(best) return {date:w.date,best}; }
+  }
+  return null;
+}
+function openSwapSheet(ei){
+  ensureDraft();
+  const ex=draft.exercises[ei]; if(!ex) return;
+  const subs=subsFor(ex.name);          // array of [name, rating] tuples
+  const list = subs.length
+    ? subs.map(s=>`<button class="swap-opt" data-swapto="${s[0].replace(/"/g,'&quot;')}" data-rating="${s[1]}"><span class="dot ${s[1]}"></span><span class="nm">${s[0]}</span><span class="tag">${RTXT[s[1]]||''}</span></button>`).join("")
+    : `<p class="small" style="color:var(--ink-2)">No back-safe substitutions on file for this movement. You can log a custom exercise with "+ Add exercise".</p>`;
+  showSheet(`<h3 style="margin:0 0 4px">Swap · ${ex.name}</h3>
+    <p class="small" style="color:var(--ink-2);margin:0 0 12px">Same muscle group, spine-safe alternatives. Scheme and any logged sets carry over.</p>
+    ${list}
+    <button class="btn ghost" onclick="closeSheet()" style="margin-top:12px">Keep current</button>`);
+  document.querySelectorAll("[data-swapto]").forEach(b=>b.onclick=()=>{
+    draft.exercises[ei].name=b.dataset.swapto;
+    draft.exercises[ei].rating=b.dataset.rating;   // scheme unchanged
+    closeSheet(); render();
+  });
+}
+function copyLastSession(){
+  ensureDraft();
+  // find the most recent prior session for this day key
+  const prior=S.workouts.filter(w=>w.key===trainDay && w.date!==todayISO()).sort((a,b)=>a.date<b.date?1:-1)[0];
+  if(!prior){ toast("No previous "+ (SPLIT.find(s=>s.key===trainDay)||{title:''}).title +" session to copy"); return; }
+  draft.exercises = JSON.parse(JSON.stringify(prior.exercises)).map(e=>({
+    name:e.name, scheme:e.scheme, rating:e.rating||muscleRating(e.name),
+    sets:(e.sets&&e.sets.length?e.sets.map(s=>({w:String(s.w||""),r:String(s.r||""),rpe:String(s.rpe||"")})):[blankSet()]),
+    note:""
+  }));
+  toast("Copied "+fmtDate(prior.date)+" — adjust and save",true);
+  render();
+}
+function muscleRating(name){ return "y"; }
+function openAddExercise(){
+  ensureDraft();
+  showSheet(`<h3 style="margin:0 0 10px">Add exercise</h3>
+    <div class="field"><span class="label">Exercise name</span><input id="axName" placeholder="e.g. Cable Row" class="tnum" style="text-align:left"/></div>
+    <div class="field" style="margin-top:10px"><span class="label">Scheme</span><input id="axScheme" placeholder="3×8–12" value="3×8–12" class="tnum" style="text-align:left"/></div>
+    <div class="field" style="margin-top:10px"><span class="label">Back-safety rating</span>
+      <div style="display:flex;gap:8px;margin-top:6px" id="axRate">
+        <button class="btn sm ghost" data-r="g">🟢 Safe</button>
+        <button class="btn sm teal" data-r="y">🟡 Brace</button>
+        <button class="btn sm ghost" data-r="r">🔴 Caution</button>
+      </div></div>
+    <button class="btn primary" id="axAdd" style="margin-top:14px">Add to session</button>
+    <button class="btn ghost" onclick="closeSheet()" style="margin-top:8px">Cancel</button>`);
+  let rating="y";
+  document.querySelectorAll("#axRate [data-r]").forEach(b=>b.onclick=()=>{
+    rating=b.dataset.r;
+    document.querySelectorAll("#axRate [data-r]").forEach(x=>{x.classList.remove("teal");x.classList.add("ghost");});
+    b.classList.remove("ghost"); b.classList.add("teal");
+  });
+  document.getElementById("axAdd").onclick=()=>{
+    const nm=(document.getElementById("axName").value||"").trim();
+    const sc=(document.getElementById("axScheme").value||"3×8–12").trim();
+    if(!nm){ toast("Name the exercise"); return; }
+    draft.exercises.push({name:nm,scheme:sc,rating,sets:[blankSet()],note:""});
+    closeSheet(); render();
+  };
+}
+function openTrainSettings(){
+  const st=S.settings||DEFAULT_SETTINGS;
+  showSheet(`<h3 style="margin:0 0 4px">Progression settings</h3>
+    <p class="small" style="color:var(--ink-2);margin:0 0 12px">Tune how Grizzly recommends your next targets. Advisory only — it never changes a logged set.</p>
+    <div class="grid g2">
+      <div class="field"><span class="label">Upper-body jump (lb)</span><input type="number" id="stUpper" value="${st.upperInc}" class="tnum"/></div>
+      <div class="field"><span class="label">Lower-body jump (lb)</span><input type="number" id="stLower" value="${st.lowerInc}" class="tnum"/></div>
+      <div class="field"><span class="label">RPE cap for progression</span><input type="number" id="stRpe" value="${st.rpeCap}" class="tnum"/></div>
+      <div class="field"><span class="label">Default rest (sec)</span><input type="number" id="stRest" value="${st.restDefault}" class="tnum"/></div>
+    </div>
+    <button class="btn primary" id="stSave" style="margin-top:14px">Save settings</button>
+    <button class="btn ghost" onclick="closeSheet()" style="margin-top:8px">Cancel</button>`);
+  document.getElementById("stSave").onclick=()=>{
+    S.settings={
+      upperInc:parseFloat(document.getElementById("stUpper").value)||DEFAULT_SETTINGS.upperInc,
+      lowerInc:parseFloat(document.getElementById("stLower").value)||DEFAULT_SETTINGS.lowerInc,
+      rpeCap:parseFloat(document.getElementById("stRpe").value)||DEFAULT_SETTINGS.rpeCap,
+      restDefault:parseFloat(document.getElementById("stRest").value)||DEFAULT_SETTINGS.restDefault
+    };
+    save(); closeSheet(); toast("Settings saved",true); render();
+  };
 }
 
 function bindFuel(){
