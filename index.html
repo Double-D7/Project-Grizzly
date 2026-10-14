@@ -372,6 +372,19 @@ nav.dock button.on:after{content:"";position:absolute;top:-8px;width:22px;height
 .mt-f,.mt-la{font-size:12px;color:var(--ink-2);min-width:42px;text-align:right}
 .mt-arrow{color:var(--mute);font-size:11px}
 .mt-d{min-width:46px;text-align:right;font-size:12px;font-weight:700}
+/* Stage 5 — daily recovery & readiness */
+.rr circle{transition:stroke-dashoffset .5s ease}
+.rc-field input[type=range]{width:100%;margin-top:6px;accent-color:var(--purple)}
+.rc-ends{display:flex;justify-content:space-between;font-size:10.5px;color:var(--mute);margin-top:2px}
+.rc-val{font-size:14px}
+.rc-live{margin-top:10px;min-height:10px}
+.rdy-strip{display:flex;align-items:center;gap:10px;border-radius:12px;padding:10px 12px;margin-bottom:12px;font-size:12.5px;line-height:1.4}
+.rdy-strip.good{background:rgba(45,212,191,.1);border:1px solid rgba(45,212,191,.3);color:var(--ink)}
+.rdy-strip.warn{background:rgba(227,160,8,.1);border:1px solid rgba(227,160,8,.35);color:var(--ink)}
+.rdy-strip.neutral{background:var(--panel-2);border:1px solid var(--line);color:var(--ink-2)}
+.rdy-badge{flex:0 0 auto;width:30px;height:30px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;background:rgba(255,255,255,.06);color:var(--ink);font-family:var(--disp)}
+.rdy-strip.good .rdy-badge{color:var(--teal)} .rdy-strip.warn .rdy-badge{color:var(--warn)}
+.rc-empty{border-color:rgba(139,92,246,.3)}
 .exhead .rest{margin-left:auto;background:transparent;border:1px solid var(--line);color:var(--ink-2);border-radius:8px;padding:5px 9px;font-size:11px;font-weight:700;display:inline-flex;gap:5px;align-items:center}
 .exhead .rest:active{background:var(--panel-2)}
 #restbar{position:fixed;left:50%;transform:translateX(-50%) translateY(24px);bottom:calc(88px + var(--safe-b));z-index:70;
@@ -943,13 +956,13 @@ const todayISO = () => new Date().toISOString().slice(0,10);
 const fmtDate = iso => { const [y,m,d]=iso.split("-"); return new Date(y,m-1,d).toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"}); };
 
 /* ---------- versioned schema + safe, non-destructive migrations ---------- */
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const DEFAULT_SETTINGS={upperInc:5,lowerInc:10,rpeCap:9,restDefault:120};
 function fresh(){
   return { schemaVersion:SCHEMA_VERSION, operator:OPERATOR, startDate:todayISO(),
     weights:{}, workouts:[], nutrition:{}, checkins:[], prs:{}, prHistory:[], groceryChecked:{},
     targets:{cal:TARGETS.cal,protein:TARGETS.protein,carbs:TARGETS.carbs,fat:TARGETS.fat},
-    adjustLog:[], mealWeek:0, debriefs:[], settings:Object.assign({},DEFAULT_SETTINGS) };
+    adjustLog:[], mealWeek:0, debriefs:[], settings:Object.assign({},DEFAULT_SETTINGS), recovery:{} };
 }
 /* Fill missing fields without ever discarding existing data. Returns s. */
 function normalizeState(s){
@@ -969,6 +982,7 @@ function normalizeState(s){
   if(!Array.isArray(s.debriefs)) s.debriefs=[];
   if(!s.settings || typeof s.settings!=='object') s.settings=Object.assign({},DEFAULT_SETTINGS);
   else { for(const k in DEFAULT_SETTINGS){ if(typeof s.settings[k]!=='number') s.settings[k]=DEFAULT_SETTINGS[k]; } }
+  if(!s.recovery || typeof s.recovery!=='object') s.recovery={};
   return s;
 }
 /* Ordered migrations. Every step preserves existing records. */
@@ -978,6 +992,7 @@ function migrate(s){
   if(v<2){ v=2; } // v1 -> v2: adds schemaVersion; fields ensured above; no data touched
   if(v<3){ v=3; } // v2 -> v3: adds debriefs[] (Grizzly Weekly Debrief history)
   if(v<4){ v=4; } // v3 -> v4: adds settings{} (progression increments, RPE cap, rest)
+  if(v<5){ v=5; } // v4 -> v5: adds recovery{} (daily readiness logs)
   s.schemaVersion = SCHEMA_VERSION;
   return s;
 }
@@ -1425,6 +1440,58 @@ function nutritionIntel(){
   return {domain:"Nutrition",confidence:c,tone,text,avgCal,avgP,adherence,
     detail:`${w.length} day(s) logged in the last 14. Planned-vs-actual tracking arrives in a later stage.`};
 }
+/* ============================================================
+   STAGE 5 — DAILY RECOVERY & READINESS (math)
+   Readiness is advisory: it informs training, never forces it.
+   ============================================================ */
+function readinessScore(r){
+  if(!r || typeof r!=='object') return null;
+  const parts=[];
+  const add=(v,w)=>{ if(v!=null && !isNaN(v)) parts.push({v:Math.max(0,Math.min(1,v)),w}); };
+  if(r.sleepHrs!=null && r.sleepHrs!=='') add((parseFloat(r.sleepHrs)-5)/3, .25);   // 5h→0, 8h→1
+  if(r.soreness!=null) add((5-Number(r.soreness))/4, .20);                           // 1 fresh → 1
+  if(r.stress!=null)   add((5-Number(r.stress))/4, .15);                             // 1 calm → 1
+  if(r.energy!=null)   add((Number(r.energy)-1)/9, .15);                             // 1–10
+  if(r.back!=null && r.back!=='') add((10-Number(r.back))/10, .25);                  // 0 pain → 1 (lumbar weight)
+  if(!parts.length) return null;
+  const wsum=parts.reduce((a,b)=>a+b.w,0);
+  let score=Math.round(parts.reduce((a,b)=>a+b.v*b.w,0)/wsum*100);
+  const base=rhrBaseline();
+  if(r.rhr && base){ const d=parseFloat(r.rhr)-base; if(d>=7) score-=8; else if(d>=4) score-=4; }
+  score=Math.max(0,Math.min(100,score));
+  let label,tone;
+  if(score>=80){label='Primed';tone='good';}
+  else if(score>=65){label='Ready';tone='good';}
+  else if(score>=45){label='Caution';tone='warn';}
+  else {label='Recover';tone='warn';}
+  const back=(r.back!=null&&r.back!=='')?Number(r.back):null;
+  let note;
+  if(back!=null && back>=5) note='Back is talking — green lifts only, skip loaded carries and spinal compression today.';
+  else if(score<45) note='Low readiness — make today a recovery day or deload: lighter loads, cut volume ~40%.';
+  else if(score<65) note='Train, but auto-regulate — leave 1–2 reps in the tank and stay under your RPE cap.';
+  else note='Green light — attack your working sets and chase the targets.';
+  return {score,label,tone,note,n:parts.length};
+}
+function rhrBaseline(){
+  const vals=[];
+  Object.values(S.recovery||{}).forEach(r=>{ if(r&&r.rhr) vals.push(parseFloat(r.rhr)); });
+  (S.checkins||[]).forEach(c=>{ if(c.rhr) vals.push(parseFloat(c.rhr)); });
+  const clean=vals.filter(v=>v>0); if(clean.length<2) return null;
+  return Math.round(clean.reduce((a,b)=>a+b,0)/clean.length);
+}
+function todayRecovery(){ return (S.recovery&&S.recovery[todayISO()])||null; }
+function readinessToday(){ return readinessScore(todayRecovery()); }
+function recoveryStreak(){
+  let streak=0; const d=new Date(todayISO()+"T00:00");
+  for(;;){ const iso=d.toISOString().slice(0,10); if(S.recovery&&S.recovery[iso]){ streak++; d.setDate(d.getDate()-1); } else break; }
+  return streak;
+}
+function recent7Readiness(){
+  const out=[]; const now=new Date(todayISO()+"T00:00");
+  for(let i=6;i>=0;i--){ const dt=new Date(now); dt.setDate(dt.getDate()-i); const iso=dt.toISOString().slice(0,10);
+    const rs=readinessScore(S.recovery&&S.recovery[iso]); if(rs) out.push({iso,score:rs.score}); }
+  return out;
+}
 function recoveryIntel(){
   const cs=S.checkins.filter(c=>(c.back!=null&&c.back!=='')||c.sleep||c.energy), c=conf(cs.length,2,4);
   if(c.k===0) return {domain:"Recovery",confidence:c,insufficient:true,tone:"neutral",
@@ -1449,6 +1516,87 @@ function topInsights(limit){
 }
 function confBadge(c){ const col=c.k>=3?'var(--good)':c.k===2?'var(--teal)':c.k===1?'var(--warn)':'var(--mute)';
   return `<span class="conf" style="color:${col};border-color:${col}55">${c.label}</span>`; }
+/* ---------- Readiness (Command Center) ---------- */
+function readinessRing(score,tone){
+  const r=26, c=2*Math.PI*r, off=c*(1-score/100);
+  const col=tone==='good'?'var(--teal)':'var(--warn)';
+  return `<svg width="68" height="68" viewBox="0 0 68 68" class="rr">
+    <circle cx="34" cy="34" r="${r}" fill="none" stroke="var(--panel-2)" stroke-width="7"/>
+    <circle cx="34" cy="34" r="${r}" fill="none" stroke="${col}" stroke-width="7" stroke-linecap="round"
+      stroke-dasharray="${c.toFixed(1)}" stroke-dashoffset="${off.toFixed(1)}" transform="rotate(-90 34 34)"/>
+    <text x="34" y="38" text-anchor="middle" font-size="19" font-weight="800" fill="var(--ink)" font-family="var(--disp)">${score}</text>
+  </svg>`;
+}
+function readinessCard(){
+  const rt=readinessToday(), streak=recoveryStreak();
+  if(!rt){
+    return `<div class="section-h"><h2>Readiness</h2><div class="rule"></div></div>
+    <div class="card rc-empty">
+      <div style="display:flex;align-items:center;gap:12px">
+        <span style="font-size:24px">🧭</span>
+        <div style="flex:1"><div style="font-weight:700;font-size:15px">How's the body today?</div>
+          <div class="small" style="color:var(--ink-2);margin-top:2px">A 15-second check-in tunes today's training to how you've recovered.</div></div>
+      </div>
+      <button class="btn primary" id="logRecovery" style="margin-top:12px">Log today's readiness</button>
+    </div>`;
+  }
+  const col=rt.tone==='good'?'var(--teal)':'var(--warn)';
+  return `<div class="section-h"><h2>Readiness</h2>${streak>1?`<span class="badge" style="background:rgba(45,212,191,.12);color:#8be7db;border-color:rgba(45,212,191,.3)">🔥 ${streak}-day</span>`:''}<div class="rule"></div></div>
+  <div class="card">
+    <div style="display:flex;align-items:center;gap:14px">
+      ${readinessRing(rt.score,rt.tone)}
+      <div style="flex:1">
+        <div style="font-weight:800;font-size:17px;color:${col}">${rt.label}</div>
+        <div class="small" style="color:var(--ink-2);margin-top:3px;line-height:1.45">${rt.note}</div>
+      </div>
+    </div>
+    <button class="btn ghost sm" id="logRecovery" style="width:auto;margin-top:12px">↻ Update today's check-in</button>
+  </div>`;
+}
+let recDraft={};
+function openRecoverySheet(){
+  const existing=todayRecovery()||{};
+  recDraft=Object.assign({sleepHrs:existing.sleepHrs??'', soreness:existing.soreness??3, stress:existing.stress??2, energy:existing.energy??7, back:existing.back??0, rhr:existing.rhr??''}, {});
+  showSheet(`<h3 style="margin:0 0 4px">Today's readiness</h3>
+    <p class="small" style="color:var(--ink-2);margin:0 0 14px">Quick gut-check on how you've recovered. Advisory — it tunes today's plan, nothing is locked.</p>
+    <div class="grid g2">
+      <div class="field"><span class="label">Sleep (hrs)</span><input type="number" inputmode="decimal" step="0.1" id="rcSleep" value="${recDraft.sleepHrs}" placeholder="7.5" class="tnum"/></div>
+      <div class="field"><span class="label">Resting HR <span style="color:var(--mute)">· optional</span></span><input type="number" inputmode="numeric" id="rcRhr" value="${recDraft.rhr}" placeholder="bpm" class="tnum"/></div>
+    </div>
+    <div class="divider"></div>
+    ${rcSlider('rcSore','Soreness',1,5,recDraft.soreness,'fresh','wrecked')}
+    ${rcSlider('rcStress','Stress',1,5,recDraft.stress,'calm','fried')}
+    ${rcSlider('rcEnergy','Energy',1,10,recDraft.energy,'flat','electric')}
+    ${rcSlider('rcBack','Back pain',0,10,recDraft.back,'forgot surgery',"can't bend")}
+    <div class="rc-live" id="rcLive"></div>
+    <button class="btn primary" id="rcSave" style="margin-top:14px">Save readiness</button>
+    <button class="btn ghost" onclick="closeSheet()" style="margin-top:8px">Cancel</button>`);
+  const upd=()=>{
+    recDraft.sleepHrs=document.getElementById('rcSleep').value;
+    recDraft.rhr=document.getElementById('rcRhr').value;
+    recDraft.soreness=+document.getElementById('rcSore').value;
+    recDraft.stress=+document.getElementById('rcStress').value;
+    recDraft.energy=+document.getElementById('rcEnergy').value;
+    recDraft.back=+document.getElementById('rcBack').value;
+    const rs=readinessScore(recDraft); const live=document.getElementById('rcLive');
+    if(rs&&live){ const col=rs.tone==='good'?'var(--teal)':'var(--warn)';
+      live.innerHTML=`<div style="display:flex;align-items:center;gap:10px;margin-top:4px"><b style="font-size:20px;color:${col}">${rs.score}</b><span style="font-weight:700;color:${col}">${rs.label}</span></div>`; }
+  };
+  document.querySelectorAll('#sheet-body input').forEach(i=>i.oninput=()=>{
+    const b=i.closest('.rc-field'); if(b){ const o=b.querySelector('.rc-val'); if(o) o.textContent=i.value; }
+    upd(); });
+  upd();
+  document.getElementById('rcSave').onclick=()=>{
+    const rec={ sleepHrs:recDraft.sleepHrs, soreness:recDraft.soreness, stress:recDraft.stress,
+      energy:recDraft.energy, back:recDraft.back, rhr:recDraft.rhr, savedAt:Date.now() };
+    S.recovery[todayISO()]=rec; save(); closeSheet(); toast('Readiness logged',true); render();
+  };
+}
+function rcSlider(id,label,min,max,val,lo,hi){
+  return `<div class="field rc-field"><span class="label" style="display:flex;justify-content:space-between">${label}<b class="rc-val tnum" style="color:var(--teal)">${val}</b></span>
+    <input type="range" id="${id}" min="${min}" max="${max}" value="${val}" step="1"/>
+    <div class="rc-ends"><span>${lo}</span><span>${hi}</span></div></div>`;
+}
 function intelCard(){
   const ins=topInsights(2);
   const rows=ins.map(i=>{
@@ -1700,6 +1848,8 @@ function VIEW_dash(){
     <canvas class="spark" id="spark"></canvas>
   </div>
 
+  ${readinessCard()}
+
   <div class="card">
     <div style="display:flex;justify-content:space-between;align-items:baseline">
       <div class="label">Phase 1 · to ${goal} lb</div>
@@ -1909,6 +2059,7 @@ function deloadSuggest(){
   if(str.plateau) reasons.push(`${str.plateau.name} has plateaued`);
   const declining=BENCHMARKS.find(declineFlag); if(declining) reasons.push(`${declining} is trending down`);
   const total=weekVolume().reduce((a,b)=>a+b.sets,0); if(total>=90) reasons.push("weekly set volume is high");
+  const r7=recent7Readiness(); if(r7.length>=3){ const avg=r7.reduce((a,b)=>a+b.score,0)/r7.length; if(avg<55) reasons.push("readiness has been low this week"); }
   return {suggest:reasons.length>=2, reasons};
 }
 
@@ -1924,6 +2075,10 @@ function VIEW_train(){
   const isRest = (trainDay==="sun" || trainDay==="thu");
   const dl = deloadSuggest();
   const vol = weekVolume();
+  const rdy = readinessToday();
+  const rdyBanner = rdy
+    ? `<div class="rdy-strip ${rdy.tone}"><span class="rdy-badge">${rdy.score}</span><div><b>${rdy.label}</b> · ${rdy.note}</div></div>`
+    : `<div class="rdy-strip neutral"><span style="font-size:18px">🧭</span><div style="flex:1">Log today's readiness to tune this session.</div><button class="btn sm ghost" id="logRecovery" style="width:auto;flex:0 0 auto">Log</button></div>`;
 
   const dayBtns = SPLIT.map(s=>{
     const isToday=s.key===DOW[new Date().getDay()];
@@ -1963,6 +2118,7 @@ function VIEW_train(){
 
   return `
   <div class="section-h"><h2>Training</h2><span class="badge">Foundation</span><div class="rule"></div></div>
+  ${rdyBanner}
   ${deloadBanner}
   <div class="days">${dayBtns}</div>
   ${isRest?"":volCard}
@@ -2568,6 +2724,7 @@ function bind(){
   // nav + any data-go
   document.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>go(b.dataset.go));
   const dbb=document.getElementById("debriefBtn"); if(dbb) dbb.onclick=()=>openDebrief();
+  const lrb=document.getElementById("logRecovery"); if(lrb) lrb.onclick=()=>openRecoverySheet();
   document.querySelectorAll("[data-applycal]").forEach(b=>b.onclick=()=>{
     applyCalorie(parseInt(b.dataset.applycal)); toast("Calorie target updated → "+T().cal+" kcal",true); render(); });
   document.querySelectorAll("[data-backup]").forEach(b=>b.onclick=()=>{ const cb=document.getElementById("bkPhotos"); doExport(!!(cb&&cb.checked)); });
