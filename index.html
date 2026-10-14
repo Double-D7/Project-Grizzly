@@ -396,11 +396,33 @@ input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;bac
 /* dock scales to 7 items */
 nav.dock button{font-size:9px;letter-spacing:.03em}
 nav.dock button svg{width:22px;height:22px}
+
+/* offline banner */
+#offbar{display:none;position:sticky;top:0;z-index:45;background:linear-gradient(180deg,#3a2a08,#2a1f06);
+  color:#f0c674;border-bottom:1px solid rgba(227,160,8,.35);text-align:center;
+  font-size:11px;font-weight:700;letter-spacing:.08em;padding:6px 12px calc(6px);padding-top:calc(6px + var(--safe-t))}
+body.offline #offbar{display:block}
+/* header net pill */
+.netpill{display:none;font-size:9px;font-weight:800;letter-spacing:.08em;padding:3px 7px;border-radius:6px;
+  background:rgba(227,160,8,.14);color:#f0c674;border:1px solid rgba(227,160,8,.35);margin-top:3px}
+body.offline .netpill{display:inline-flex}
+
+/* bottom-sheet modal */
+#sheet-overlay{position:fixed;inset:0;z-index:90;background:rgba(0,0,0,.6);backdrop-filter:blur(3px);
+  display:none;align-items:flex-end;justify-content:center}
+#sheet-overlay.show{display:flex}
+#sheet-overlay .sheet{background:linear-gradient(180deg,var(--panel),#171a1e);border:1px solid var(--line);
+  border-top-left-radius:18px;border-top-right-radius:18px;width:100%;max-width:560px;
+  padding:18px 16px calc(20px + var(--safe-b));box-shadow:var(--shadow);max-height:86vh;overflow-y:auto;animation:sheetUp .25s ease}
+@keyframes sheetUp{from{transform:translateY(34px);opacity:.5}to{transform:none;opacity:1}}
+.sheet-h{font-family:var(--disp);text-transform:uppercase;font-weight:700;font-size:17px;letter-spacing:.05em;margin-bottom:8px}
 </style>
 </head>
 <body>
+<div id="offbar">OFFLINE · changes save on this device</div>
 <div id="app"></div>
 <div id="toast"></div>
+<div id="sheet-overlay"><div class="sheet" id="sheet-body"></div></div>
 
 <script>
 "use strict";
@@ -855,51 +877,162 @@ const KEY = "projectGrizzly.v1";
 const todayISO = () => new Date().toISOString().slice(0,10);
 const fmtDate = iso => { const [y,m,d]=iso.split("-"); return new Date(y,m-1,d).toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"}); };
 
+/* ---------- versioned schema + safe, non-destructive migrations ---------- */
+const SCHEMA_VERSION = 2;
 function fresh(){
-  return {
-    operator:OPERATOR, startDate:todayISO(),
-    weights:{},            // iso -> lbs
-    workouts:[],           // {id,date,key,title,exercises:[{name,scheme,rating,sets:[{w,r,rpe}],note}]}
-    nutrition:{},          // iso -> {meals:{}, supps:{}, water, steps, protein,carbs,fat}
-    checkins:[],           // {id,date,operation,measurements,bp,rhr,sleep,energy,hunger,stress,back,cardio,wins,focus,photos:{}}
-    prs:{},                // exName -> {w,r,e1rm,date}
-    prHistory:[],          // [{name,w,r,e1rm,date}] append-only feed
-    groceryChecked:{},
-  };
+  return { schemaVersion:SCHEMA_VERSION, operator:OPERATOR, startDate:todayISO(),
+    weights:{}, workouts:[], nutrition:{}, checkins:[], prs:{}, prHistory:[], groceryChecked:{},
+    targets:{cal:TARGETS.cal,protein:TARGETS.protein,carbs:TARGETS.carbs,fat:TARGETS.fat},
+    adjustLog:[], mealWeek:0 };
+}
+/* Fill missing fields without ever discarding existing data. Returns s. */
+function normalizeState(s){
+  if(!s || typeof s!=='object') s={};
+  if(typeof s.operator!=='string') s.operator=OPERATOR;
+  if(typeof s.startDate!=='string') s.startDate=todayISO();
+  if(!s.weights || typeof s.weights!=='object') s.weights={};
+  if(!Array.isArray(s.workouts)) s.workouts=[];
+  if(!s.nutrition || typeof s.nutrition!=='object') s.nutrition={};
+  if(!Array.isArray(s.checkins)) s.checkins=[];
+  if(!s.prs || typeof s.prs!=='object') s.prs={};
+  if(!Array.isArray(s.prHistory)) s.prHistory=[];
+  if(!s.groceryChecked || typeof s.groceryChecked!=='object') s.groceryChecked={};
+  if(!s.targets || typeof s.targets!=='object') s.targets={cal:TARGETS.cal,protein:TARGETS.protein,carbs:TARGETS.carbs,fat:TARGETS.fat};
+  if(!Array.isArray(s.adjustLog)) s.adjustLog=[];
+  if(typeof s.mealWeek!=='number') s.mealWeek=0;
+  return s;
+}
+/* Ordered migrations. Every step preserves existing records. */
+function migrate(s){
+  s=normalizeState(s||{});
+  let v = (typeof s.schemaVersion==='number') ? s.schemaVersion : 1;
+  if(v<2){ v=2; } // v1 -> v2: fields ensured above (adds schemaVersion); no data touched
+  s.schemaVersion = SCHEMA_VERSION;
+  return s;
 }
 let S;
-try { S = JSON.parse(localStorage.getItem(KEY)) || fresh(); } catch(e){ S = fresh(); }
-if(!Array.isArray(S.prHistory)) S.prHistory=[];   // migrate older saves
-if(!S.targets) S.targets={cal:TARGETS.cal,protein:TARGETS.protein,carbs:TARGETS.carbs,fat:TARGETS.fat};
-if(!Array.isArray(S.adjustLog)) S.adjustLog=[];
-if(typeof S.mealWeek!=='number') S.mealWeek=0;
-function save(){ try{ localStorage.setItem(KEY, JSON.stringify(S)); }catch(e){ toast("Storage full — export soon"); } scheduleVault(); }
+try { const raw=localStorage.getItem(KEY); const parsed=raw?JSON.parse(raw):null; S = (parsed && typeof parsed==='object') ? migrate(parsed) : fresh(); }
+catch(e){ S = fresh(); }
+function save(){ try{ localStorage.setItem(KEY, JSON.stringify(S)); }catch(e){ toast("Storage full — export a backup and free space"); } scheduleVault(); }
 
-/* ---------- resilient backup: IDB vault mirror + file export/restore ----------
-   The vault is a SEPARATE IndexedDB store, so if another app on this web address
-   clears localStorage, your data survives here and auto-restores on next open.
-   The file export is your off-device safety net (save it to Files / iCloud). */
-const VAULT_DB="grizzlyVault", VAULT_STORE="state", VAULT_KEY="S";
+/* ---------- resilient backup: IDB vault + daily snapshots + file export/restore ----------
+   • vault   : a SEPARATE IndexedDB store mirroring state — a same-origin
+     localStorage wipe can't lose your data (it auto-restores on next open).
+   • snapshots: one dated copy per day (last 14 kept) so you can roll back a day.
+   • file export: your off-device safety net with an integrity checksum. */
+const VAULT_DB="grizzlyVault", VAULT_STORE="state", VAULT_SNAPS="snapshots", VAULT_KEY="S", SNAP_KEEP=14;
 let vaultT=null;
-function vaultOpen(){ return new Promise((res,rej)=>{ const rq=indexedDB.open(VAULT_DB,1);
-  rq.onupgradeneeded=()=>{ const db=rq.result; if(!db.objectStoreNames.contains(VAULT_STORE)) db.createObjectStore(VAULT_STORE); };
+function vaultOpen(){ return new Promise((res,rej)=>{ const rq=indexedDB.open(VAULT_DB,2);
+  rq.onupgradeneeded=()=>{ const db=rq.result; if(!db.objectStoreNames.contains(VAULT_STORE)) db.createObjectStore(VAULT_STORE); if(!db.objectStoreNames.contains(VAULT_SNAPS)) db.createObjectStore(VAULT_SNAPS); };
   rq.onsuccess=()=>res(rq.result); rq.onerror=()=>rej(rq.error); }); }
-function vaultSave(obj){ return vaultOpen().then(db=>new Promise(res=>{ const tx=db.transaction(VAULT_STORE,"readwrite"); tx.objectStore(VAULT_STORE).put(obj,VAULT_KEY); tx.oncomplete=res; tx.onerror=res; })).catch(()=>{}); }
+function vaultSave(obj){ return vaultOpen().then(db=>new Promise(res=>{
+    const tx=db.transaction([VAULT_STORE,VAULT_SNAPS],"readwrite");
+    tx.objectStore(VAULT_STORE).put(obj,VAULT_KEY);
+    if(hasData(obj)) tx.objectStore(VAULT_SNAPS).put({date:todayISO(),savedAt:Date.now(),state:obj}, todayISO());
+    tx.oncomplete=()=>{ pruneSnaps(); res(); }; tx.onerror=res;
+  })).catch(()=>{}); }
 function vaultLoad(){ return vaultOpen().then(db=>new Promise(res=>{ const tx=db.transaction(VAULT_STORE,"readonly").objectStore(VAULT_STORE).get(VAULT_KEY); tx.onsuccess=()=>res(tx.result||null); tx.onerror=()=>res(null); })).catch(()=>null); }
+function pruneSnaps(){ return vaultOpen().then(db=>new Promise(res=>{
+    const st=db.transaction(VAULT_SNAPS,"readwrite").objectStore(VAULT_SNAPS); const kr=st.getAllKeys();
+    kr.onsuccess=()=>{ const keys=(kr.result||[]).sort(); const extra=keys.length-SNAP_KEEP; for(let i=0;i<extra;i++) st.delete(keys[i]); res(); }; kr.onerror=res;
+  })).catch(()=>{}); }
+function snapshotList(){ return vaultOpen().then(db=>new Promise(res=>{
+    const st=db.transaction(VAULT_SNAPS,"readonly").objectStore(VAULT_SNAPS); const req=st.getAll();
+    req.onsuccess=()=>{ const arr=(req.result||[]).map(r=>({date:r.date,savedAt:r.savedAt,state:r.state,
+       counts:{weights:Object.keys(r.state&&r.state.weights||{}).length, workouts:((r.state&&r.state.workouts)||[]).length, checkins:((r.state&&r.state.checkins)||[]).length}}))
+       .sort((a,b)=> a.date<b.date?1:-1); res(arr); }; req.onerror=()=>res([]); })).catch(()=>[]); }
 function scheduleVault(){ if(!('indexedDB'in window))return; clearTimeout(vaultT); vaultT=setTimeout(()=>vaultSave(S),400); }
 function hasData(o){ return !!(o && ((o.weights&&Object.keys(o.weights).length) || (o.checkins&&o.checkins.length) || (o.workouts&&o.workouts.length) || (o.prHistory&&o.prHistory.length))); }
-function normalizeState(){ if(!Array.isArray(S.prHistory))S.prHistory=[]; if(!S.targets)S.targets={cal:TARGETS.cal,protein:TARGETS.protein,carbs:TARGETS.carbs,fat:TARGETS.fat}; if(!Array.isArray(S.adjustLog))S.adjustLog=[]; if(typeof S.mealWeek!=='number')S.mealWeek=0; if(!S.groceryChecked)S.groceryChecked={}; if(!S.nutrition)S.nutrition={}; if(!S.prs)S.prs={}; }
-function doExport(){
-  try{ const blob=new Blob([JSON.stringify(S,null,2)],{type:"application/json"});
-    const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="project-grizzly-backup-"+todayISO()+".json";
-    document.body.appendChild(a); a.click(); setTimeout(()=>{a.remove(); URL.revokeObjectURL(a.href);},1200);
-    S.lastBackup=todayISO(); save(); toast("Backup saved — choose “Save to Files”",true);
+function checksum(str){ let h=0x811c9dc5>>>0; for(let i=0;i<str.length;i++){ h^=str.charCodeAt(i); h=Math.imul(h,0x01000193)>>>0; } return ('0000000'+h.toString(16)).slice(-8); }
+
+async function doExport(includePhotos){
+  try{
+    const payload={ app:"Project Grizzly", type:"grizzly-backup", schemaVersion:SCHEMA_VERSION, exportedAt:new Date().toISOString(),
+      counts:{ weigh_ins:Object.keys(S.weights||{}).length, workouts:(S.workouts||[]).length, check_ins:(S.checkins||[]).length, photos:0 },
+      data:S, photos:null };
+    if(includePhotos && ('indexedDB'in window)){ payload.photos=await idbAll().catch(()=>[]); payload.counts.photos=(payload.photos||[]).length; }
+    payload.checksum=checksum(JSON.stringify(payload.data)+"|"+JSON.stringify(payload.photos||[]));
+    const blob=new Blob([JSON.stringify(payload)],{type:"application/json"});
+    const a=document.createElement("a"); a.href=URL.createObjectURL(blob);
+    a.download="project-grizzly-backup-"+todayISO()+(includePhotos?"-full":"")+".json";
+    document.body.appendChild(a); a.click(); setTimeout(()=>{a.remove(); URL.revokeObjectURL(a.href);},1500);
+    S.lastBackup=todayISO(); save();
+    toast((includePhotos?"Full backup":"Backup")+" saved — choose “Save to Files”",true);
   }catch(e){ toast("Backup failed — try again"); }
 }
-function doImport(file){ if(!file) return; const rd=new FileReader();
-  rd.onload=()=>{ try{ const obj=JSON.parse(rd.result); if(!obj||typeof obj!=='object') throw 0; S=obj; normalizeState(); save(); toast("Backup restored — welcome back",true); render(); }
-    catch(err){ toast("Couldn't read that backup file"); } };
+/* parse new wrapped backup OR a legacy raw-state export; compute a preview */
+function parseBackup(text){
+  const obj=JSON.parse(text);
+  if(obj && obj.type==="grizzly-backup" && obj.data && typeof obj.data==='object'){
+    const data=obj.data, photos=Array.isArray(obj.photos)?obj.photos:null;
+    let integrity="none";
+    if(obj.checksum) integrity=(checksum(JSON.stringify(data)+"|"+JSON.stringify(photos||[]))===obj.checksum)?"ok":"mismatch";
+    return { data, photos, exportedAt:obj.exportedAt||null, schemaVersion:obj.schemaVersion||1, integrity,
+      counts:{ weigh_ins:Object.keys(data.weights||{}).length, workouts:(data.workouts||[]).length, check_ins:(data.checkins||[]).length, photos:(photos||[]).length } };
+  }
+  if(obj && typeof obj==='object' && (obj.weights||obj.workouts||obj.checkins||obj.operator)){
+    return { data:obj, photos:null, exportedAt:null, schemaVersion:obj.schemaVersion||1, integrity:"legacy",
+      counts:{ weigh_ins:Object.keys(obj.weights||{}).length, workouts:(obj.workouts||[]).length, check_ins:(obj.checkins||[]).length, photos:0 } };
+  }
+  throw new Error("unrecognized");
+}
+let pendingRestore=null;
+function previewImport(file){ if(!file) return; const rd=new FileReader();
+  rd.onload=()=>{ try{ pendingRestore=parseBackup(rd.result); openRestoreSheet(pendingRestore); } catch(e){ toast("That file isn't a Project Grizzly backup"); } };
+  rd.onerror=()=>toast("Couldn't read that file");
   rd.readAsText(file); }
+async function doRestore(pr){
+  if(!pr || !pr.data) return;
+  S=migrate(pr.data); save();
+  if(pr.photos && pr.photos.length && ('indexedDB'in window)){ try{ for(const p of pr.photos){ if(p&&p.id) await idbPut(p); } photoCache=null; }catch(e){} }
+  pendingRestore=null; closeSheet(); toast("Backup restored — welcome back, Operator",true); render();
+}
+async function restoreSnapshot(date){
+  const list=await snapshotList(); const snap=list.find(s=>s.date===date);
+  if(!snap){ toast("Snapshot not found"); return; }
+  S=migrate(snap.state); save(); closeSheet(); toast("Rolled back to "+fmtDate(date),true); render();
+}
+function doImport(file){ previewImport(file); } // kept for compatibility
+
+/* ---------- bottom-sheet modal (restore preview, snapshots) ---------- */
+function showSheet(html){ const ov=document.getElementById("sheet-overlay"); if(!ov) return; document.getElementById("sheet-body").innerHTML=html; ov.classList.add("show"); }
+function closeSheet(){ const ov=document.getElementById("sheet-overlay"); if(ov) ov.classList.remove("show"); }
+function openRestoreSheet(pr){
+  const int=pr.integrity;
+  const intLabel = int==="ok" ? '<span style="color:var(--good)">✓ Integrity verified</span>'
+    : int==="mismatch" ? '<span style="color:var(--bad)">⚠ Integrity check FAILED — the file may be corrupt</span>'
+    : int==="legacy" ? '<span style="color:var(--mute)">Legacy backup (no checksum)</span>'
+    : '<span style="color:var(--mute)">No checksum in file</span>';
+  showSheet(`<div class="sheet-h">Restore this backup?</div>
+    <p class="hint" style="margin:0 0 10px">This <b>replaces</b> everything currently in the app with the file's contents. Your current data is also snapshotted first.</p>
+    <div class="kvs">
+      <span class="kv">Exported <b>${pr.exportedAt?fmtDate(pr.exportedAt.slice(0,10)):'unknown'}</b></span>
+      <span class="kv">Weigh-ins <b class="tnum">${pr.counts.weigh_ins}</b></span>
+      <span class="kv">Workouts <b class="tnum">${pr.counts.workouts}</b></span>
+      <span class="kv">Check-ins <b class="tnum">${pr.counts.check_ins}</b></span>
+      <span class="kv">Photos <b class="tnum">${pr.counts.photos}</b></span>
+    </div>
+    <div class="small" style="margin:10px 0 14px">${intLabel}${pr.schemaVersion?(' · schema v'+pr.schemaVersion):''}</div>
+    <div class="rowbtn">
+      <button class="btn primary" id="confirmRestore">Restore &amp; replace</button>
+      <button class="btn ghost" id="cancelRestore">Cancel</button>
+    </div>`);
+  document.getElementById("confirmRestore").onclick=()=>doRestore(pendingRestore);
+  document.getElementById("cancelRestore").onclick=()=>{ pendingRestore=null; closeSheet(); };
+}
+async function openSnapshotSheet(){
+  const list=await snapshotList();
+  const rows = list.length ? list.map(s=>`<div class="histrow"><div><div class="a">${fmtDate(s.date)}</div>
+      <div class="b tnum">${s.counts.weights} weigh-ins · ${s.counts.workouts} workouts · ${s.counts.checkins} check-ins</div></div>
+      <button class="btn sm" data-snap="${s.date}">Roll back</button></div>`).join("")
+    : '<div class="empty">No on-device snapshots yet — they build up automatically as you log each day.</div>';
+  showSheet(`<div class="sheet-h">Earlier on-device snapshots</div>
+    <p class="hint" style="margin:0 0 6px">Automatic daily copies kept on this device (last ${SNAP_KEEP} days). Roll back if something looks off.</p>
+    <div style="margin-top:6px">${rows}</div>
+    <div class="rowbtn" style="margin-top:12px"><button class="btn ghost" id="snapClose">Close</button></div>`);
+  document.querySelectorAll("[data-snap]").forEach(b=>b.onclick=()=>restoreSnapshot(b.dataset.snap));
+  document.getElementById("snapClose").onclick=closeSheet;
+}
 
 /* ---------- dynamic targets + coaching engine ---------- */
 function T(){ const t=S.targets||{}; return {
@@ -1227,7 +1360,7 @@ function header(){
       <div class="t1">PROJECT <b>GRIZZLY</b></div>
       <div class="t2">Operator · ${OPERATOR}</div>
     </div>
-    <div class="op"><div class="n tnum">${op}</div><div class="l">Operation</div></div>
+    <div class="op"><div class="n tnum">${op}</div><div class="l">Operation</div><span class="netpill">Offline</span></div>
   </header>`;
 }
 function dock(){
@@ -1297,13 +1430,15 @@ function VIEW_dash(){
   ${(()=>{ const backed=S.lastBackup, warn=!backed; return `
   <div class="section-h"><h2>Data Safety</h2>${warn?'<span class="badge" style="background:rgba(240,85,59,.14);color:#f5a394;border-color:rgba(240,85,59,.35)">Back up</span>':''}<div class="rule"></div></div>
   <div class="card" style="${warn?'border-color:rgba(240,85,59,.35)':''}">
-    <p class="hint" style="margin:0 0 10px">Your log lives on this device. Save a backup to your <b>Files / iCloud</b> so it can never be lost. It also auto-saves a hidden on-device copy.</p>
+    <p class="hint" style="margin:0 0 10px">Your log lives on this device with an automatic on-device copy and daily snapshots. Save a file backup to your <b>Files / iCloud</b> so it can never be lost.</p>
+    <label class="check" style="border:0;padding:4px 2px 8px"><input type="checkbox" id="bkPhotos" style="width:18px;height:18px;accent-color:var(--purple)"/> <span class="tx"><span class="m" style="font-size:13.5px">Include progress photos</span><span class="d">Larger file — keeps your transformation photos too</span></span></label>
     <div class="rowbtn">
       <button class="btn teal" data-backup>⬇︎ Back up now</button>
-      <button class="btn ghost" data-restore>Restore</button>
+      <button class="btn ghost" data-restore>Restore…</button>
     </div>
-    <input type="file" id="restoreFile" accept="application/json" style="display:none"/>
-    <div class="small" style="margin-top:9px">${backed?('✓ Last backup '+fmtDate(backed)):'⚠ Not backed up yet — tap Back up now'}</div>
+    <button class="btn ghost sm" id="snapBtn" style="width:auto;margin-top:10px">↩ Earlier snapshots</button>
+    <input type="file" id="restoreFile" accept="application/json,.json" style="display:none"/>
+    <div class="small" style="margin-top:9px">${backed?('✓ Last file backup '+fmtDate(backed)):'⚠ No file backup yet — tap Back up now'}</div>
   </div>`; })()}
 
   <div class="section-h"><h2>Today's Mission</h2><div class="rule"></div></div>
@@ -1918,9 +2053,10 @@ function bind(){
   document.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>go(b.dataset.go));
   document.querySelectorAll("[data-applycal]").forEach(b=>b.onclick=()=>{
     applyCalorie(parseInt(b.dataset.applycal)); toast("Calorie target updated → "+T().cal+" kcal",true); render(); });
-  document.querySelectorAll("[data-backup]").forEach(b=>b.onclick=doExport);
+  document.querySelectorAll("[data-backup]").forEach(b=>b.onclick=()=>{ const cb=document.getElementById("bkPhotos"); doExport(!!(cb&&cb.checked)); });
   document.querySelectorAll("[data-restore]").forEach(b=>b.onclick=()=>{ const f=document.getElementById("restoreFile"); if(f) f.click(); });
-  const rf=document.getElementById("restoreFile"); if(rf) rf.onchange=e=>doImport(e.target.files[0]);
+  const rf=document.getElementById("restoreFile"); if(rf) rf.onchange=e=>previewImport(e.target.files[0]);
+  const sb=document.getElementById("snapBtn"); if(sb) sb.onclick=openSnapshotSheet;
 
   if(route==="weigh") bindWeigh();
   if(route==="train") bindTrain();
@@ -2148,9 +2284,19 @@ render();
 // If localStorage looks empty but the vault has data (e.g. another same-origin
 // app cleared storage), recover automatically.
 if(!hasData(S) && ('indexedDB' in window)){
-  vaultLoad().then(v=>{ if(hasData(v)){ S=v; normalizeState(); save(); render(); toast("Recovered your data from on-device backup",true); } });
+  vaultLoad().then(v=>{ if(hasData(v)){ S=migrate(v); save(); render(); toast("Recovered your data from on-device backup",true); } });
 } else { scheduleVault(); }
 window.addEventListener("resize",()=>{ if(route==="dash")drawSpark(); if(route==="fuel")drawMacros(); if(route==="progress")drawProgress(); });
+
+/* offline indicator */
+function netUpdate(announce){ const off=!navigator.onLine; document.body.classList.toggle("offline",off);
+  if(announce) toast(off?"You're offline — changes save on this device":"Back online",true); }
+window.addEventListener("online",()=>netUpdate(true));
+window.addEventListener("offline",()=>netUpdate(true));
+netUpdate(false);
+
+/* tap the dimmed background to close the bottom sheet */
+(function(){ const ov=document.getElementById("sheet-overlay"); if(ov) ov.addEventListener("click",e=>{ if(e.target===ov) closeSheet(); }); })();
 </script>
 <script>
 /* Register SW + auto-refresh to the newest version when one is deployed.
