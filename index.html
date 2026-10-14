@@ -397,6 +397,22 @@ input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;bac
 nav.dock button{font-size:9px;letter-spacing:.03em}
 nav.dock button svg{width:22px;height:22px}
 
+/* grizzly intelligence */
+.intel-row{display:flex;gap:11px;padding:11px 0;border-top:1px solid var(--line-soft)}
+.intel-row:first-child{border-top:0}
+.intel-row .dot{margin-top:5px}
+.itx{flex:1;min-width:0}
+.itx .il{font-weight:700;font-size:14px;line-height:1.35}
+.itx .id{font-size:12px;color:var(--mute);margin-top:3px;line-height:1.45}
+.itx .imeta{display:flex;align-items:center;gap:8px;margin-top:6px}
+.itx .idom{font-size:9px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;color:var(--mute)}
+.conf{font-size:9px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;border-radius:999px;border:1px solid}
+/* weekly debrief */
+.db-sec{padding:11px 0;border-top:1px solid var(--line-soft)}
+.db-sec:first-child{border-top:0}
+.db-h{font-family:var(--disp);text-transform:uppercase;font-size:12px;letter-spacing:.1em;color:var(--purple);margin-bottom:5px}
+.db-b{font-size:13.5px;color:var(--ink-2);line-height:1.5;margin-top:3px}
+
 /* offline banner */
 #offbar{display:none;position:sticky;top:0;z-index:45;background:linear-gradient(180deg,#3a2a08,#2a1f06);
   color:#f0c674;border-bottom:1px solid rgba(227,160,8,.35);text-align:center;
@@ -878,12 +894,12 @@ const todayISO = () => new Date().toISOString().slice(0,10);
 const fmtDate = iso => { const [y,m,d]=iso.split("-"); return new Date(y,m-1,d).toLocaleDateString(undefined,{weekday:"short",month:"short",day:"numeric"}); };
 
 /* ---------- versioned schema + safe, non-destructive migrations ---------- */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 function fresh(){
   return { schemaVersion:SCHEMA_VERSION, operator:OPERATOR, startDate:todayISO(),
     weights:{}, workouts:[], nutrition:{}, checkins:[], prs:{}, prHistory:[], groceryChecked:{},
     targets:{cal:TARGETS.cal,protein:TARGETS.protein,carbs:TARGETS.carbs,fat:TARGETS.fat},
-    adjustLog:[], mealWeek:0 };
+    adjustLog:[], mealWeek:0, debriefs:[] };
 }
 /* Fill missing fields without ever discarding existing data. Returns s. */
 function normalizeState(s){
@@ -900,13 +916,15 @@ function normalizeState(s){
   if(!s.targets || typeof s.targets!=='object') s.targets={cal:TARGETS.cal,protein:TARGETS.protein,carbs:TARGETS.carbs,fat:TARGETS.fat};
   if(!Array.isArray(s.adjustLog)) s.adjustLog=[];
   if(typeof s.mealWeek!=='number') s.mealWeek=0;
+  if(!Array.isArray(s.debriefs)) s.debriefs=[];
   return s;
 }
 /* Ordered migrations. Every step preserves existing records. */
 function migrate(s){
   s=normalizeState(s||{});
   let v = (typeof s.schemaVersion==='number') ? s.schemaVersion : 1;
-  if(v<2){ v=2; } // v1 -> v2: fields ensured above (adds schemaVersion); no data touched
+  if(v<2){ v=2; } // v1 -> v2: adds schemaVersion; fields ensured above; no data touched
+  if(v<3){ v=3; } // v2 -> v3: adds debriefs[] (Grizzly Weekly Debrief history)
   s.schemaVersion = SCHEMA_VERSION;
   return s;
 }
@@ -1211,6 +1229,168 @@ function strengthSeries(exName){
     .filter(Boolean).sort((a,b)=>a.t<b.t?-1:1);
 }
 
+/* ============================================================
+   GRIZZLY INTELLIGENCE ENGINE
+   Pure analytics. Rules: never invent data; mark estimates as "est.";
+   attach a confidence to every insight; recommend — never auto-apply.
+   ============================================================ */
+const DAYMS=86400000;
+function dnum(iso){ return Math.round(new Date(iso+"T00:00").getTime()/DAYMS); }
+function linReg(pts){ const n=pts.length; if(n<2) return null;
+  let sx=0,sy=0,sxx=0,sxy=0; for(const p of pts){ sx+=p.x; sy+=p.y; sxx+=p.x*p.x; sxy+=p.x*p.y; }
+  const d=n*sxx-sx*sx; return d? (n*sxy-sx*sy)/d : null; }
+function conf(have, medAt, highAt){
+  if(have < Math.ceil(medAt/2)) return {label:"Insufficient data", k:0};
+  if(have < medAt) return {label:"Low confidence", k:1};
+  if(have < highAt) return {label:"Medium confidence", k:2};
+  return {label:"High confidence", k:3};
+}
+function rollingAvg(n){ const d=sortedWeightDates(); if(!d.length) return null; const v=d.slice(-n).map(k=>S.weights[k]); return round1(v.reduce((a,b)=>a+b,0)/v.length); }
+function weightRatePerWeek(days){
+  const d=sortedWeightDates(); if(d.length<3) return null;
+  const cutoff=dnum(todayISO())-days;
+  const pts=d.filter(k=>dnum(k)>=cutoff).map(k=>({x:dnum(k),y:S.weights[k]}));
+  if(pts.length<3) return null; const slope=linReg(pts); return slope==null?null:round1(slope*7);
+}
+function bodyCompEstimate(){ const w=latestWeight(), bf=navyBF(); if(w==null||bf==null) return null;
+  return {weight:w, bf, lean:round1(w*(1-bf/100)), fat:round1(w*bf/100)}; }
+
+function bodyIntel(){
+  const n=sortedWeightDates().length, c=conf(n,14,28);
+  if(c.k===0) return {domain:"Body",confidence:c,insufficient:true,tone:"neutral",
+    text:`Log ${Math.max(1,7-n)} more morning weigh-ins to unlock weight-trend analysis.`,
+    detail:"Weigh in each morning under the same conditions — the averages do the rest."};
+  const a7=rollingAvg(7), a28=rollingAvg(28), rate=weightRatePerWeek(28) ?? weeklyRate();
+  let tone="good", text;
+  if(rate==null){ tone="neutral"; text=`7-day average ${a7} lb — a few more days sets the trend.`; }
+  else if(rate> -0.35){ tone="warn"; text=`Fat loss has stalled (${rate>0?'+':''}${rate} lb/wk over ~4 weeks).`; }
+  else if(rate< -1.25){ tone="warn"; text=`Dropping fast — ${Math.abs(rate)} lb/wk. Protect muscle; a small calorie bump may help.`; }
+  else { tone="good"; text=`On track — down ${Math.abs(rate)} lb/wk toward your ${Math.abs(TARGET_RATE)} lb/wk goal.`; }
+  const cmp = (a7!=null&&a28!=null) ? (a7<a28?" Short-term is below the month — momentum is good." : a7>a28?" Short-term is above the month — watch the last week." : " Holding steady.") : "";
+  return {domain:"Body",confidence:c,tone,text,rate,a7,a28,
+    detail:`7-day avg ${a7??'—'} lb${a28!=null?` · 28-day avg ${a28} lb`:''}.${cmp} Daily swings are normal.`};
+}
+function trackedSessions(){ return S.workouts.filter(w=>w.exercises&&w.exercises.some(e=>e.sets&&e.sets.some(s=>parseFloat(s.w)>0))).length; }
+function strengthIntel(){
+  const lifts=[]; const seen=new Set();
+  BENCHMARKS.forEach(nm=>{ const s=strengthSeries(nm); if(s.length>=2){ lifts.push({name:nm,s}); seen.add(nm); } });
+  const names=new Set(); S.workouts.forEach(w=>w.exercises&&w.exercises.forEach(e=>names.add(e.name)));
+  names.forEach(nm=>{ if(!seen.has(nm)){ const s=strengthSeries(nm); if(s.length>=3) lifts.push({name:nm,s}); } });
+  const sessions=trackedSessions(), c=conf(sessions,6,12);
+  if(!lifts.length || c.k===0) return {domain:"Strength",confidence:c,insufficient:true,tone:"neutral",
+    text:`Log a few more tracked sessions to unlock strength trends.`,detail:"Each lift needs ≥2 sessions to estimate a trend (Epley e1RM)."};
+  const trends=lifts.map(({name,s})=>{ const slope=linReg(s.map(p=>({x:dnum(p.t),y:p.v})))||0;
+    const first=s[0].v,last=s[s.length-1].v, pct=first?round1((last-first)/first*100):0;
+    const pr=S.prs[name]; const daysSincePR=pr?(dnum(todayISO())-dnum(pr.date)):null;
+    return {name,slope,pct,first,last,n:s.length,daysSincePR}; });
+  trends.sort((a,b)=>b.pct-a.pct);
+  const best=trends[0];
+  const plateau=trends.find(t=>t.n>=4 && Math.abs(t.slope)<0.3 && (t.daysSincePR==null||t.daysSincePR>=21));
+  const rate=weightRatePerWeek(28)??weeklyRate();
+  let tone,text,detail;
+  if(plateau){ tone="warn"; text=`${plateau.name} has plateaued (flat e1RM${plateau.daysSincePR!=null?`, no PR in ${plateau.daysSincePR}d`:''}).`;
+    detail=`Add a rep in range or a small load bump — deload if it persists. Best mover: ${best.name} ${best.pct>0?'+':''}${best.pct}%.`; }
+  else { tone="good"; text=`${best.name} up ${best.pct>0?'+':''}${best.pct}% (est. e1RM ${best.first}→${best.last}).`;
+    detail=`${lifts.length} tracked lift(s) over ${sessions} sessions.${(rate!=null&&rate<-0.2&&best.pct>=0)?" Strength holding while weight drops — recomp is working.":""}`; }
+  return {domain:"Strength",confidence:c,tone,text,detail,best,plateau};
+}
+function nutritionWindow(days){ const out=[]; const now=new Date();
+  for(let i=0;i<days;i++){ const dt=new Date(now); dt.setDate(dt.getDate()-i); const iso=dt.toISOString().slice(0,10);
+    const nn=S.nutrition[iso]; if(nn && (nn.protein||nn.carbs||nn.fat)) out.push({iso,cal:Math.round((nn.protein||0)*4+(nn.carbs||0)*4+(nn.fat||0)*9),p:nn.protein||0}); }
+  return out; }
+function nutritionIntel(){
+  const w=nutritionWindow(14), c=conf(w.length,5,10);
+  if(c.k===0) return {domain:"Nutrition",confidence:c,insufficient:true,tone:"neutral",
+    text:`Log your macros on a few more days to unlock nutrition analysis.`,detail:"Enter protein / carbs / fat on the Fuel tab."};
+  const t=T(), avgCal=Math.round(w.reduce((a,b)=>a+b.cal,0)/w.length), avgP=Math.round(w.reduce((a,b)=>a+b.p,0)/w.length);
+  const adherence=Math.round(w.filter(d=>d.p>=t.protein*0.9).length/w.length*100);
+  const rate=weightRatePerWeek(28)??weeklyRate();
+  let tone="good", text;
+  if(avgP < t.protein*0.85){ tone="warn"; text=`Protein is running low — avg ${avgP} g vs ${t.protein} g target.`; }
+  else if(rate!=null && rate>-0.2 && avgCal>=t.cal-50){ tone="warn"; text=`Intake (~${avgCal} kcal avg) looks high for a stalled scale — a 150 kcal trim may restart loss.`; }
+  else { tone="good"; text=`Nutrition on point — ~${avgCal} kcal avg, protein ${avgP} g (${adherence}% of days on target).`; }
+  return {domain:"Nutrition",confidence:c,tone,text,avgCal,avgP,adherence,
+    detail:`${w.length} day(s) logged in the last 14. Planned-vs-actual tracking arrives in a later stage.`};
+}
+function recoveryIntel(){
+  const cs=S.checkins.filter(c=>(c.back!=null&&c.back!=='')||c.sleep||c.energy), c=conf(cs.length,2,4);
+  if(c.k===0) return {domain:"Recovery",confidence:c,insufficient:true,tone:"neutral",
+    text:`Complete a couple of Sunday check-ins to unlock recovery trends.`,detail:"Sleep, energy, stress and back pain are tracked each week."};
+  const last=S.checkins[S.checkins.length-1], prev=S.checkins[S.checkins.length-2];
+  const backNow=last&&last.back!=null&&last.back!==''?Number(last.back):null;
+  const backPrev=prev&&prev.back!=null&&prev.back!==''?Number(prev.back):null;
+  const sleep=last&&last.sleep?parseFloat(last.sleep):null;
+  let tone="good", text;
+  if(backNow!=null&&backPrev!=null&&backNow-backPrev>=2){ tone="warn"; text=`Back pain rose to ${backNow}/10 (was ${backPrev}). Favor green lifts; ease loaded carries.`; }
+  else if(backNow!=null&&backNow>=5){ tone="warn"; text=`Back pain ${backNow}/10 — prioritize the McGill Big 3 and avoid yellow/red movements this week.`; }
+  else if(sleep!=null&&sleep<6.5){ tone="warn"; text=`Sleep averaging ${sleep} h — strength and recovery suffer under 7 h.`; }
+  else { tone="good"; text=`Recovery looks solid${backNow!=null?` — back ${backNow}/10`:''}${sleep!=null?`, sleep ${sleep} h`:''}.`; }
+  return {domain:"Recovery",confidence:c,tone,text,detail:`From ${cs.length} check-in(s).`};
+}
+function allIntel(){ return [bodyIntel(), strengthIntel(), nutritionIntel(), recoveryIntel()]; }
+function topInsights(limit){
+  const all=allIntel(), actionable=all.filter(x=>!x.insufficient);
+  actionable.sort((a,b)=> (a.tone==="warn"?0:1)-(b.tone==="warn"?0:1) || b.confidence.k-a.confidence.k);
+  if(actionable.length) return actionable.slice(0,limit||2);
+  return [all.sort((a,b)=>b.confidence.k-a.confidence.k)[0]];
+}
+function confBadge(c){ const col=c.k>=3?'var(--good)':c.k===2?'var(--teal)':c.k===1?'var(--warn)':'var(--mute)';
+  return `<span class="conf" style="color:${col};border-color:${col}55">${c.label}</span>`; }
+function intelCard(){
+  const ins=topInsights(2);
+  const rows=ins.map(i=>{
+    const dot = i.insufficient ? '<span class="dot" style="background:var(--line);box-shadow:none"></span>'
+      : `<span class="dot ${i.tone==='warn'?'y':'g'}"></span>`;
+    return `<div class="intel-row">${dot}<div class="itx"><div class="il">${i.text}</div>${i.detail?`<div class="id">${i.detail}</div>`:''}
+      <div class="imeta"><span class="idom">${i.domain}</span>${confBadge(i.confidence)}</div></div></div>`;
+  }).join("");
+  return `<div class="section-h"><h2>Grizzly Intelligence</h2><div class="rule"></div></div>
+  <div class="card">${rows}
+    <button class="btn primary" id="debriefBtn" style="margin-top:12px">📋 Weekly Debrief</button>
+  </div>`;
+}
+
+/* ---------- Grizzly Weekly Debrief ---------- */
+function buildDebrief(){
+  const body=bodyIntel(), str=strengthIntel(), nut=nutritionIntel(), rec=recoveryIntel(), bc=bodyCompEstimate();
+  const prWk=(S.prHistory||[]).filter(p=>(dnum(todayISO())-dnum(p.date))<=7);
+  const attention=[body,str,nut,rec].filter(x=>!x.insufficient&&x.tone==="warn").map(x=>x.text);
+  const pri=[];
+  if(body.tone==="warn"&&/stalled/i.test(body.text)) pri.push("Trim ~150 kcal (from carbs) to restart fat loss; recheck the 7-day average in two weeks.");
+  if(rec.tone==="warn") pri.push("Protect the back — green-rated lifts, McGill Big 3 daily, and 7.5+ h sleep.");
+  if(str.plateau) pri.push(`Break the ${str.plateau.name} plateau: one more rep in range or a small load bump; deload if it persists.`);
+  if(nut.tone==="warn"&&/protein/i.test(nut.text)) pri.push(`Protein first, every meal — target ${T().protein} g/day.`);
+  const defaults=["Log every morning weigh-in — the 7-day average drives every call.","Complete all planned sessions and earn one rep or 5 lb where you can.","Run the Sunday check-in with measurements and a photo for clean trend data."];
+  for(const d of defaults){ if(pri.length>=3) break; if(!pri.includes(d)) pri.push(d); }
+  const sections=[
+    {h:"Body Composition", body:[body.text, body.detail, bc?`Est. lean ${bc.lean} lb · est. fat ${bc.fat} lb (${bc.bf}% BF, Navy — estimate).`:null].filter(Boolean)},
+    {h:"Strength & Training", body:[str.text, str.detail].filter(Boolean)},
+    {h:"Nutrition", body:[nut.text, nut.detail].filter(Boolean)},
+    {h:"Recovery", body:[rec.text, rec.detail].filter(Boolean)},
+    {h:"Personal Records · last 7 days", body: prWk.length? prWk.map(p=>`🥇 ${p.name} — ${p.w} × ${p.r} (est. e1RM ${p.e1rm})`) : ["No new PRs this week — bank one next session."]},
+    {h:"Needs Attention", body: attention.length? attention : ["Nothing flagged — stay consistent."]},
+    {h:"Three Priorities · next week", body: pri.slice(0,3).map((x,i)=>`${i+1}. ${x}`)},
+  ];
+  return { id:"db"+Date.now(), date:todayISO(), generatedAt:new Date().toISOString(), operation:operationNo(), compliance:compliance(), sections };
+}
+function debriefText(d){ return `PROJECT GRIZZLY — WEEKLY DEBRIEF\n${fmtDate(d.date)} · Operation ${String(d.operation).padStart(3,'0')} · Compliance ${d.compliance}%\n\n`+d.sections.map(s=>s.h.toUpperCase()+"\n"+s.body.join("\n")).join("\n\n"); }
+function copyText(txt){ const done=()=>toast("Debrief copied",true);
+  if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(txt).then(done,done); } else { try{ const ta=document.createElement("textarea"); ta.value=txt; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); }catch(e){} done(); } }
+function openDebrief(existing){
+  const d = existing || buildDebrief();
+  if(!existing){ S.debriefs=(S.debriefs||[]).filter(x=>x.date!==d.date); S.debriefs.push(d); save(); }
+  const secHtml=d.sections.map(s=>`<div class="db-sec"><div class="db-h">${s.h}</div>${s.body.map(b=>`<div class="db-b">${b}</div>`).join("")}</div>`).join("");
+  const hist=(S.debriefs||[]).slice().reverse().filter(x=>x.id!==d.id).slice(0,8);
+  showSheet(`<div class="sheet-h">Grizzly Weekly Debrief</div>
+    <div class="small" style="margin:-4px 0 10px">${fmtDate(d.date)} · Operation ${String(d.operation).padStart(3,'0')} · Compliance ${d.compliance}%</div>
+    ${secHtml}
+    <div class="rowbtn" style="margin-top:14px"><button class="btn teal" id="dbCopy">Copy to send</button><button class="btn ghost" id="dbClose">Close</button></div>
+    ${hist.length?`<div class="r-label" style="margin-top:16px">Past debriefs</div>${hist.map(h=>`<div class="histrow"><div><div class="a">${fmtDate(h.date)}</div><div class="b">Operation ${String(h.operation).padStart(3,'0')}</div></div><button class="btn sm ghost" data-db="${h.id}">Open</button></div>`).join("")}`:''}`);
+  document.getElementById("dbClose").onclick=closeSheet;
+  document.getElementById("dbCopy").onclick=()=>copyText(debriefText(d));
+  document.querySelectorAll("[data-db]").forEach(b=>b.onclick=()=>{ const f=(S.debriefs||[]).find(x=>x.id===b.dataset.db); if(f) openDebrief(f); });
+}
+
 /* ---------- generic line chart ---------- */
 function drawLineChart(cv, pts, opts){
   opts=opts||{}; const dpr=window.devicePixelRatio||1;
@@ -1424,6 +1604,8 @@ function VIEW_dash(){
     <div class="tile"><div class="k">Waist · navel</div><div class="v purple tnum">${latestCheckin()?.measurements?.waistNavel||"—"}<small>"</small></div><div class="sub">Primary metric</div></div>
     <div class="tile"><div class="k">Compliance</div><div class="v tnum">${comp}<small>%</small></div><div class="sub">Last 7 days</div></div>
   </div>
+
+  ${intelCard()}
 
   ${coachCard()}
 
@@ -2051,6 +2233,7 @@ const VIEWS={dash:VIEW_dash,weigh:VIEW_weigh,train:VIEW_train,fuel:VIEW_fuel,pro
 function bind(){
   // nav + any data-go
   document.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>go(b.dataset.go));
+  const dbb=document.getElementById("debriefBtn"); if(dbb) dbb.onclick=()=>openDebrief();
   document.querySelectorAll("[data-applycal]").forEach(b=>b.onclick=()=>{
     applyCalorie(parseInt(b.dataset.applycal)); toast("Calorie target updated → "+T().cal+" kcal",true); render(); });
   document.querySelectorAll("[data-backup]").forEach(b=>b.onclick=()=>{ const cb=document.getElementById("bkPhotos"); doExport(!!(cb&&cb.checked)); });
