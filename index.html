@@ -346,6 +346,32 @@ nav.dock button.on:after{content:"";position:absolute;top:-8px;width:22px;height
 .cs-sec{margin-bottom:4px}
 .cs-beat{font-size:12.5px;color:var(--ink);padding:4px 0}
 .cs-beat .small{color:var(--mute)}
+/* Stage 4 — adaptive nutrition (planned vs consumed) + transformation lab */
+.pvc-row{display:flex;align-items:center;gap:10px;padding:5px 0}
+.pvc-l{width:72px;font-size:12.5px;color:var(--ink);font-weight:600}
+.pvc-bar{flex:1;height:8px;background:var(--panel-2);border-radius:6px;overflow:hidden}
+.pvc-fill{height:100%;border-radius:6px;transition:width .3s}
+.pvc-v{min-width:82px;text-align:right;font-size:12px}
+.pvc-v .small{color:var(--mute)}
+.an-rec{display:flex;align-items:center;gap:10px;border-radius:12px;padding:11px 12px;font-size:13.5px}
+.an-rec.good{background:rgba(63,185,80,.1);border:1px solid rgba(63,185,80,.3)}
+.an-rec.warn{background:rgba(227,160,8,.1);border:1px solid rgba(227,160,8,.35)}
+.an-rec.neutral{background:var(--panel-2);border:1px solid var(--line);color:var(--ink-2)}
+.tl-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:12px}
+.tl-tile{background:var(--panel-2);border:1px solid var(--line);border-radius:12px;padding:12px;text-align:center}
+.tl-n{font-family:var(--disp);font-size:22px;font-weight:700;color:var(--teal)}
+.tl-l{font-size:10.5px;color:var(--mute);letter-spacing:.03em;text-transform:uppercase;margin-top:2px}
+.tl-projs{display:flex;flex-direction:column;gap:8px}
+.tl-eta{display:flex;justify-content:space-between;align-items:center;background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.tl-eta-k{font-size:12.5px;color:var(--ink);font-weight:600}
+.tl-eta-v{font-size:12.5px;font-weight:700;color:var(--purple)}
+.tl-proj.neutral{background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:11px 12px;font-size:12.5px;color:var(--ink-2)}
+.mt-row{display:flex;align-items:center;gap:8px;padding:5px 0;border-top:1px solid var(--line-soft)}
+.mt-row:first-of-type{border-top:0}
+.mt-l{flex:1;font-size:12.5px;color:var(--ink)}
+.mt-f,.mt-la{font-size:12px;color:var(--ink-2);min-width:42px;text-align:right}
+.mt-arrow{color:var(--mute);font-size:11px}
+.mt-d{min-width:46px;text-align:right;font-size:12px;font-weight:700}
 .exhead .rest{margin-left:auto;background:transparent;border:1px solid var(--line);color:var(--ink-2);border-radius:8px;padding:5px 9px;font-size:11px;font-weight:700;display:inline-flex;gap:5px;align-items:center}
 .exhead .rest:active{background:var(--panel-2)}
 #restbar{position:fixed;left:50%;transform:translateX(-50%) translateY(24px);bottom:calc(88px + var(--safe-b));z-index:70;
@@ -1282,6 +1308,66 @@ function weightRatePerWeek(days){
 function bodyCompEstimate(){ const w=latestWeight(), bf=navyBF(); if(w==null||bf==null) return null;
   return {weight:w, bf, lean:round1(w*(1-bf/100)), fat:round1(w*bf/100)}; }
 
+/* ============================================================
+   STAGE 4 — TRANSFORMATION LAB + ADAPTIVE NUTRITION (math)
+   Projections are estimates, confidence-gated; never auto-apply.
+   ============================================================ */
+function addWeeksISO(n){ const d=new Date(todayISO()+"T00:00"); d.setDate(d.getDate()+Math.round(n*7)); return d.toISOString().slice(0,10); }
+function checkinBF(c){ const wa=parseFloat(c.measurements&&c.measurements.waistNavel), nk=parseFloat(c.measurements&&c.measurements.neck);
+  if(!wa||!nk||wa<=nk) return null;
+  return round1(Math.max(4,Math.min(50,86.010*Math.log10(wa-nk)-70.041*Math.log10(PROFILE.heightIn)+36.76))); }
+function checkinLeanSeries(){
+  return S.checkins.map(c=>{ const bf=checkinBF(c); const w=(c.weight!=null&&c.weight!=='')?parseFloat(c.weight):null;
+    if(bf==null||!w) return null; return {date:c.date, v:round1(w*(1-bf/100)), bf, weight:round1(w)}; }).filter(Boolean)
+    .sort((a,b)=>a.date<b.date?-1:1);
+}
+function measurementTrends(){
+  return MEASURE_FIELDS.map(([k,l])=>{
+    const cs=S.checkins.filter(c=>c.measurements && c.measurements[k]!=null && c.measurements[k]!=='' && !isNaN(parseFloat(c.measurements[k])));
+    if(!cs.length) return null;
+    const first=parseFloat(cs[0].measurements[k]), last=parseFloat(cs[cs.length-1].measurements[k]);
+    return {key:k, label:l, first:round1(first), last:round1(last), delta:round1(last-first), n:cs.length};
+  }).filter(Boolean);
+}
+// project ETA to the active-phase goal (PROFILE.goalHigh lb, PROFILE.goalBF %)
+function transformProjection(){
+  const nW=sortedWeightDates().length, c=conf(nW,14,28);
+  const w=latestWeight();
+  if(w==null || c.k===0) return {insufficient:true, confidence:c};
+  const cur=rollingAvg(28) ?? sevenDayAvg() ?? w;
+  const rate=weightRatePerWeek(28) ?? weeklyRate();     // lb/wk, negative = losing
+  const goalW=PROFILE.goalHigh, toGo=round1(cur-goalW);
+  const losing = rate!=null && rate < -0.05;
+  let weeksW=null, etaW=null;
+  if(losing && toGo>0){ weeksW=Math.ceil(toGo/Math.abs(rate)); etaW=addWeeksISO(weeksW); }
+  const bc=bodyCompEstimate(); let bf=null,lean=null,fat=null,bfToGo=null,weeksBF=null,etaBF=null,wAtGoalBF=null;
+  if(bc){ bf=bc.bf; lean=bc.lean; fat=bc.fat; bfToGo=round1(bf-PROFILE.goalBF);
+    wAtGoalBF=round1(lean/(1-PROFILE.goalBF/100));        // weight if lean held and BF hits goal
+    const wToLose=round1(cur-wAtGoalBF);
+    if(losing && wToLose>0){ weeksBF=Math.ceil(wToLose/Math.abs(rate)); etaBF=addWeeksISO(weeksBF); }
+  }
+  let leanTrend=null; const ls=checkinLeanSeries();
+  if(ls.length>=2){ leanTrend={delta:round1(ls[ls.length-1].v-ls[0].v), first:ls[0].v, last:ls[ls.length-1].v, n:ls.length}; }
+  return {insufficient:false, confidence:c, cur:round1(cur), rate, goalW, toGo, losing,
+    weeksW, etaW, bf, lean, fat, bfToGo, wAtGoalBF, weeksBF, etaBF, leanTrend};
+}
+// adaptive nutrition: planned targets vs consumed averages + adherence
+function consumedAvg(days){
+  const w=nutritionWindow(days); if(!w.length) return null;
+  let P=0,C=0,F=0,K=0,n=0;
+  w.forEach(d=>{ const nn=S.nutrition[d.iso]; if(!nn) return; P+=nn.protein||0; C+=nn.carbs||0; F+=nn.fat||0; K+=d.cal; n++; });
+  if(!n) return null;
+  return {days:n, protein:Math.round(P/n), carbs:Math.round(C/n), fat:Math.round(F/n), cal:Math.round(K/n)};
+}
+function nutritionSplit(){
+  const t=T(), c7=consumedAvg(7), w=nutritionWindow(14), c=conf(w.length,5,10);
+  const planned={protein:t.protein, carbs:t.carbs, fat:t.fat, cal:t.cal};
+  let adherence=null, proteinDays=null;
+  if(w.length){ proteinDays=w.filter(d=>d.p>=t.protein*0.9).length;
+    adherence=Math.round(w.filter(d=>Math.abs(d.cal-t.cal)<=250).length/w.length*100); }
+  return {confidence:c, insufficient:c.k===0, planned, consumed:c7, loggedDays:w.length, adherence, proteinDays};
+}
+
 function bodyIntel(){
   const n=sortedWeightDates().length, c=conf(n,14,28);
   if(c.k===0) return {domain:"Body",confidence:c,insufficient:true,tone:"neutral",
@@ -2006,6 +2092,9 @@ function VIEW_fuel(){
     </div>
   </div>
 
+  <div class="section-h"><h2>Adaptive Nutrition</h2><span class="badge" style="background:rgba(139,92,246,.12);color:#c3b0fb;border-color:rgba(139,92,246,.3)">Planned vs eaten</span><div class="rule"></div></div>
+  ${adaptiveNutritionCard()}
+
   <div class="section-h"><h2>Meal Plan</h2><span class="badge">Week ${(S.mealWeek||0)+1} / 12</span><div class="rule"></div></div>
   <div class="card">
     <div class="field" style="margin-bottom:12px"><span class="label">Rotate your week — never eat the same thing for a year</span>
@@ -2054,6 +2143,101 @@ function macroValue(key){
   if(key==="cal") return Math.round((n.protein||0)*4+(n.carbs||0)*4+(n.fat||0)*9);
   return n[key]||0;
 }
+function pvcRow(label,planned,consumed,unit){
+  const pct = planned>0 ? Math.min(140, Math.round(consumed/planned*100)) : 0;
+  const over = consumed>planned*1.05, under = consumed<planned*0.85;
+  const col = under?'var(--warn)':over?'var(--purple)':'var(--teal)';
+  return `<div class="pvc-row">
+    <div class="pvc-l">${label}</div>
+    <div class="pvc-bar"><div class="pvc-fill" style="width:${Math.min(100,pct)}%;background:${col}"></div></div>
+    <div class="pvc-v"><b class="tnum" style="color:${col}">${consumed}</b><span class="small"> / ${planned}${unit}</span></div>
+  </div>`;
+}
+function adaptiveNutritionCard(){
+  const s=nutritionSplit(), cc=coachCalorie();
+  if(s.insufficient){
+    return `<div class="card"><div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:18px">🍽️</span>
+      <span class="small" style="color:var(--ink-2)">Log protein/carbs/fat on a few more days to compare planned vs eaten and unlock adaptive targets.</span>
+    </div>${confBadge(s.confidence)}</div>`;
+  }
+  const c=s.consumed, p=s.planned;
+  const rows = c ? (pvcRow("Protein",p.protein,c.protein,"g")+pvcRow("Carbs",p.carbs,c.carbs,"g")+pvcRow("Fat",p.fat,c.fat,"g")+pvcRow("Calories",p.cal,c.cal,"")) : `<p class="small" style="color:var(--ink-2)">No consumed data in the last 7 days.</p>`;
+  // adaptive recommendation
+  let rec='';
+  if(cc.status==='need-data'){ rec=`<div class="an-rec neutral">🧭 ${cc.msg}</div>`; }
+  else {
+    const map={hold:['Hold the plan',`Trend is on target — keep ${cc.cal} kcal.`],
+               cut:['Trim calories',`Loss has stalled — a cut to ${cc.newCal} kcal may restart it.`],
+               add:['Add calories',`Dropping fast — ${cc.newCal} kcal protects muscle.`]};
+    const m=map[cc.status]||map.hold;
+    const canApply = cc.status!=='hold' && cc.ready;
+    rec=`<div class="an-rec ${cc.status==='hold'?'good':'warn'}">
+      <div style="flex:1"><b>${m[0]}</b><div class="small" style="color:var(--ink-2);margin-top:2px">${m[1]}</div></div>
+      ${canApply?`<button class="btn sm primary" data-applycal="${cc.newCal}" style="width:auto;flex:0 0 auto">${cc.newCal} kcal</button>`
+        :`<span class="badge" style="flex:0 0 auto">${cc.status==='hold'?'On track':('Reassess '+Math.max(0,14-daysSinceAdjust())+'d')}</span>`}
+    </div>`;
+  }
+  return `<div class="card">
+    <div class="label" style="margin-bottom:10px">7-day average eaten vs your planned targets${c?` · ${c.days} day${c.days>1?'s':''} logged`:''}</div>
+    ${rows}
+    ${(c&&s.loggedDays)?`<div class="small" style="color:var(--ink-2);margin-top:8px">Protein target hit on <b style="color:var(--ink)">${s.proteinDays}/${s.loggedDays}</b> logged days · averaging <b style="color:var(--ink)">${Math.abs(c.cal-p.cal)} kcal ${c.cal<p.cal?'under':'over'}</b> plan</div>`:''}
+    <div class="divider" style="margin:12px 0 10px"></div>
+    ${rec}
+    ${confBadge(s.confidence)}
+  </div>`;
+}
+/* ---------- TRANSFORMATION LAB ---------- */
+function transformLabCard(){
+  const t=transformProjection();
+  if(t.insufficient){
+    return `<div class="card"><div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:18px">🔬</span>
+      <span class="small" style="color:var(--ink-2)">Log morning weigh-ins (and a check-in with waist + neck) to project your path to ${PROFILE.goalHigh} lb @ ${PROFILE.goalBF}% body fat.</span>
+    </div>${confBadge(t.confidence)}</div>`;
+  }
+  const tiles=[];
+  tiles.push(`<div class="tl-tile"><div class="tl-n">${t.cur}</div><div class="tl-l">lb · 28-day</div></div>`);
+  if(t.bf!=null) tiles.push(`<div class="tl-tile"><div class="tl-n">${t.bf}%</div><div class="tl-l">body fat est.</div></div>`);
+  if(t.lean!=null) tiles.push(`<div class="tl-tile"><div class="tl-n">${t.lean}</div><div class="tl-l">lb lean est.</div></div>`);
+  if(t.rate!=null) tiles.push(`<div class="tl-tile"><div class="tl-n">${t.rate>0?'+':''}${t.rate}</div><div class="tl-l">lb / week</div></div>`);
+  let proj='';
+  if(!t.losing){
+    proj=`<div class="tl-proj neutral">Scale isn't trending down yet — dial in the deficit and the ETA appears here.</div>`;
+  } else {
+    const parts=[];
+    if(t.weeksW!=null) parts.push(`<div class="tl-eta"><span class="tl-eta-k">Goal weight ${t.goalW} lb</span><span class="tl-eta-v">~${t.weeksW} wk · ${fmtDate(t.etaW)}</span></div>`);
+    else if(t.toGo<=0) parts.push(`<div class="tl-eta"><span class="tl-eta-k">Goal weight ${t.goalW} lb</span><span class="tl-eta-v" style="color:var(--teal)">reached ✓</span></div>`);
+    if(t.weeksBF!=null) parts.push(`<div class="tl-eta"><span class="tl-eta-k">Goal ${PROFILE.goalBF}% body fat</span><span class="tl-eta-v">~${t.weeksBF} wk · ${fmtDate(t.etaBF)}</span></div>`);
+    else if(t.bfToGo!=null && t.bfToGo<=0) parts.push(`<div class="tl-eta"><span class="tl-eta-k">Goal ${PROFILE.goalBF}% body fat</span><span class="tl-eta-v" style="color:var(--teal)">reached ✓</span></div>`);
+    proj=parts.length?`<div class="tl-projs">${parts.join("")}</div><p class="hint" style="margin:8px 0 0">Estimates at your current ${Math.abs(t.rate)} lb/wk pace — they shift as the trend does.</p>`:'';
+  }
+  let leanLine='';
+  if(t.leanTrend){ const d=t.leanTrend.delta; const good=d>=-1;
+    leanLine=`<div class="divider" style="margin:12px 0 10px"></div>
+      <div class="small" style="color:var(--ink-2)">Lean mass across ${t.leanTrend.n} check-ins: <b style="color:${good?'var(--teal)':'var(--warn)'}">${d>0?'+':''}${d} lb</b> ${good?'— muscle holding while you lean out. Recomp is working.':'— some lean loss; keep protein high and strength heavy.'}</div>`;
+  }
+  return `<div class="card">
+    <div class="tl-grid">${tiles.join("")}</div>
+    ${proj}
+    ${leanLine}
+    ${confBadge(t.confidence)}
+  </div>`;
+}
+function measureTrendCard(){
+  const rows=measurementTrends();
+  if(!rows.length) return '';
+  const body=rows.map(r=>{ const shrink=r.delta<0, grow=r.delta>0;
+    const isWaist=/waist/i.test(r.label);
+    const good = isWaist ? shrink : grow;   // waist down = good; limbs up = good
+    const col = r.delta===0?'var(--ink-2)':(good?'var(--teal)':'var(--warn)');
+    return `<div class="mt-row"><div class="mt-l">${r.label}</div>
+      <div class="mt-f tnum">${r.first}"</div><div class="mt-arrow">→</div><div class="mt-la tnum">${r.last}"</div>
+      <div class="mt-d tnum" style="color:${col}">${r.delta>0?'+':''}${r.delta}"</div></div>`;
+  }).join("");
+  return `<div class="section-h"><h2 style="font-size:14px">Measurement Trends</h2><div class="rule"></div></div>
+    <div class="card"><div class="small" style="color:var(--ink-2);margin-bottom:8px">First check-in → latest. Waist shrinking and limbs growing is the recomp signature.</div>${body}</div>`;
+}
 
 /* ---------- PROGRESS (charts + photos) ---------- */
 let progMetric="weight", progPose="Front", progA=null, progB=null, photoCache=null;
@@ -2088,6 +2272,10 @@ function VIEW_progress(){
     <div class="chart-wrap"><canvas class="chart" id="trendChart"></canvas></div>
     <div class="chart-meta" id="chartMeta"></div>
   </div>
+
+  <div class="section-h"><h2 style="font-size:14px">Transformation Lab</h2><span class="badge" style="background:rgba(139,92,246,.12);color:#c3b0fb;border-color:rgba(139,92,246,.3)">${PROFILE.goalHigh} lb @ ${PROFILE.goalBF}%</span><div class="rule"></div></div>
+  ${transformLabCard()}
+  ${measureTrendCard()}
 
   <div class="section-h"><h2 style="font-size:14px">Progress Photos</h2><div class="rule"></div></div>
   <div class="card">
